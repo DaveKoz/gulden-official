@@ -783,7 +783,7 @@ bool ProcessBlockFound(const std::shared_ptr<const CBlock> pblock, const CChainP
 
 
     // Process this block the same as if we had received it from another node
-    if (!ProcessNewBlock(chainparams, pblock, true, NULL))
+    if (!ProcessNewBlock(chainparams, pblock, true, NULL, false, true))
         return error("GuldenMiner: ProcessNewBlock, block not accepted");
 
     return true;
@@ -965,7 +965,7 @@ void static GuldenMiner(const CChainParams& chainparams)
                                                 }
                                                 else
                                                 {
-                                                    if (ProcessNewBlock(Params(), embeddedWitnessBlock, true, nullptr))
+                                                    if (ProcessNewBlock(Params(), embeddedWitnessBlock, true, nullptr, false, true))
                                                     {
                                                         if (mapBlockIndex.count(hashPoW2Witness) > 0)
                                                         {
