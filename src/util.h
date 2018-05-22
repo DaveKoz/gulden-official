@@ -108,6 +108,7 @@ namespace BCLog {
         LEVELDB     = (1 << 21),
         DELTA       = (1 << 22),
         WITNESS     = (1 << 23),
+        WALLET      = (1 << 24),
         ALL         = ~(uint32_t)0,
     };
 }
