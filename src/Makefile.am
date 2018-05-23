@@ -208,6 +208,7 @@ GULDEN_CORE_H = \
   wallet/db.h \
   wallet/feebumper.h \
   wallet/rpcwallet.h \
+	wallet/spvscanner.h \
   wallet/wallet.h \
   wallet/walletdb.h \
   wallet/walletdberrors.h \
@@ -290,6 +291,7 @@ libgulden_wallet_a_SOURCES = \
   wallet/feebumper.cpp \
   wallet/rpcdump.cpp \
   wallet/rpcwallet.cpp \
+	wallet/spvscanner.cpp \
   wallet/wallet.cpp \
   wallet/walletdb.cpp \
   $(GULDEN_CORE_H)
