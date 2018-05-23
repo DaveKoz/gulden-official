@@ -51,6 +51,7 @@ protected:
     virtual void GetScriptForMining(std::shared_ptr<CReserveScript>&, CAccount* forAccount) {};
     virtual void NewPoWValidBlock(const CBlockIndex *pindex, const std::shared_ptr<const CBlock>& block) {};
     virtual void ProcessPriorityRequest(const std::shared_ptr<const CBlock> &block, const CBlockIndex *pindex) {};
+    virtual void HeaderTipChanged(const CBlockIndex *pTip) {};
     friend void ::RegisterValidationInterface(CValidationInterface*);
     friend void ::UnregisterValidationInterface(CValidationInterface*);
     friend void ::UnregisterAllValidationInterfaces();
@@ -89,6 +90,11 @@ struct CMainSignals {
     boost::signals2::signal<void (const CBlockIndex *, const std::shared_ptr<const CBlock>&)> NewPoWValidBlock;
     /** Notify listeners that a priority requested block is ready to process */
     boost::signals2::signal<void (const std::shared_ptr<const CBlock> &, const CBlockIndex *pindex)> ProcessPriorityRequest;
+    /** Notify listeners that tip of headerChain changed.
+     *  It is triggered for live changes only, ie. not when loading the index or processing external block files etc.
+    */
+    boost::signals2::signal<void (const CBlockIndex *pTip)> HeaderTipChanged;
+
 };
 
 CMainSignals& GetMainSignals();

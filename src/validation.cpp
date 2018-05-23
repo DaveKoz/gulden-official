@@ -3978,6 +3978,21 @@ static bool AcceptBlockHeader(const CBlockHeader& block, CValidationState& state
     return true;
 }
 
+static void CheckAndNotifyHeaderTip()
+{
+    static const CBlockIndex* pPreviousHeaderTip = nullptr;
+    bool fNotify = false;
+    {
+        LOCK(cs_main);
+        if (headerChain.Tip() != pPreviousHeaderTip) {
+            fNotify = true;
+            pPreviousHeaderTip = headerChain.Tip();
+        }
+    }
+    if (fNotify)
+        GetMainSignals().HeaderTipChanged(pPreviousHeaderTip);
+}
+
 // Exposed wrapper for AcceptBlockHeader
 bool ProcessNewBlockHeaders(const std::vector<CBlockHeader>& headers, CValidationState& state, const CChainParams& chainparams, const CBlockIndex** ppindex, bool fAssumePOWGood)
 {
@@ -3993,6 +4008,9 @@ bool ProcessNewBlockHeaders(const std::vector<CBlockHeader>& headers, CValidatio
             }
         }
     }
+
+    CheckAndNotifyHeaderTip();
+
     return true;
 }
 
@@ -4274,6 +4292,8 @@ bool ProcessNewBlock(const CChainParams& chainparams, const std::shared_ptr<cons
         // Gulden: check pending sync-checkpoint
         Checkpoints::AcceptPendingSyncCheckpoint(chainparams);
     }
+
+    CheckAndNotifyHeaderTip();
 
     return true;
 }
