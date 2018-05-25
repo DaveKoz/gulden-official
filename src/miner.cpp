@@ -25,6 +25,7 @@
 #include "Gulden/auto_checkpoints.h"
 #include "hash.h"
 #include "validation.h"
+#include "witnessvalidation.h"
 #include "net.h"
 #include "policy/feerate.h"
 #include "policy/policy.h"
@@ -1301,7 +1302,7 @@ CMutableTransaction CreateWitnessCoinbase(int nWitnessHeight, int nPoW2PhasePare
     return coinbaseTx;
 }
 
-//fixme: (2.0) If running for a very long time this will eventually use up obscene amounts of memory - empty it every now and again
+
 //fixme: (2.1) We should also check for already signed block coming from ourselves (from e.g. a different machine - think witness devices for instance) - Don't sign it if we already have a signed copy of the block lurking around...
 std::set<CBlockIndex*, CBlockIndexCacheComparator> cacheAlreadySeenWitnessCandidates;
 
@@ -1313,22 +1314,28 @@ void static GuldenWitness()
     static bool hashCity = IsArgSet("-testnet") ? ( GetArg("-testnet", "")[0] == 'C' ? true : false ) : false;
     static bool regTest = GetBoolArg("-regtest", false);
 
+    uint64_t nTimeTotal = 0;
+
     CChainParams chainparams = Params();
     try
     {
         while (true)
         {
-            if (!regTest && !hashCity)
+            if (!regTest)
             {
                 // Busy-wait for the network to come online so we don't waste time mining
                 // on an obsolete chain. In regtest mode we expect to fly solo.
-                do {
-                    if (g_connman->GetNodeCount(CConnman::CONNECTIONS_ALL) > 0 && !IsInitialBlockDownload())
-                        break;
-                    MilliSleep(1000);
+                do
+                {
+                    if (hashCity || g_connman->GetNodeCount(CConnman::CONNECTIONS_ALL) > 0)
+                    {
+                        if(!IsInitialBlockDownload())
+                            break;
+                    }
+                    MilliSleep(5000);
                 } while (true);
             }
-
+            DO_BENCHMARK("WIT: GuldenWitness", BCLog::BENCH|BCLog::WITNESS);
 
             CBlockIndex* pindexTip = chainActive.Tip();
             Consensus::Params pParams = chainparams.GetConsensus();

@@ -12,7 +12,6 @@
 #include "guiutil.h"
 #include "guiconstants.h"
 #include "optionsmodel.h"
-#include "platformstyle.h"
 #include "receiverequestdialog.h"
 #include "recentrequeststablemodel.h"
 #include "walletmodel.h"
@@ -98,7 +97,7 @@ public:
 
 bool ReceiveCoinsDialog::showCopyQRAsImagebutton = true;
 
-ReceiveCoinsDialog::ReceiveCoinsDialog(const PlatformStyle *_platformStyle, QWidget *parent)
+ReceiveCoinsDialog::ReceiveCoinsDialog(const QStyle *_platformStyle, QWidget *parent)
 : QDialog( parent )
 , ui( new Ui::ReceiveCoinsDialog )
 , model( 0 )
@@ -201,11 +200,11 @@ void ReceiveCoinsDialog::setShowCopyQRAsImageButton(bool showCopyQRAsImagebutton
     ui->accountSaveQRButton->setVisible(showCopyQRAsImagebutton_);
 }
 
-void ReceiveCoinsDialog::activeAccountChanged()
+void ReceiveCoinsDialog::activeAccountChanged(CAccount* activeAccount)
 {
     LogPrintf("ReceiveCoinsDialog::activeAccountChanged\n");
 
-    setActiveAccount(model->getActiveAccount());
+    setActiveAccount(activeAccount);
 }
 
 void ReceiveCoinsDialog::updateQRCode(const QString& uri)
@@ -231,8 +230,8 @@ void ReceiveCoinsDialog::setModel(WalletModel *_model)
 {
     this->model = _model;
 
-    connect(model, SIGNAL(activeAccountChanged()), this, SLOT(activeAccountChanged()));
-    activeAccountChanged();
+    connect(model, SIGNAL(activeAccountChanged(CAccount*)), this, SLOT(activeAccountChanged(CAccount*)));
+    activeAccountChanged(model->getActiveAccount());
 
     if(model && model->getOptionsModel())
     {
@@ -573,7 +572,7 @@ void ReceiveCoinsDialog::loadBuyViewFinished(bool bOk)
     #endif
 }
 
-#ifdef defined(HAVE_WEBKIT)
+#ifdef HAVE_WEBKIT
 void ReceiveCoinsDialog::sslErrorHandler(QNetworkReply* qnr, const QList<QSslError> & errlist)
 {
     qnr->ignoreSslErrors();

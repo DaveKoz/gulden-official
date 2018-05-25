@@ -16,7 +16,6 @@
 #include "units.h"
 #include "guiutil.h"
 #include "optionsmodel.h"
-#include "platformstyle.h"
 #include "txmempool.h"
 #include "walletmodel.h"
 
@@ -53,7 +52,7 @@ bool CCoinControlWidgetItem::operator<(const QTreeWidgetItem &other) const {
     return QTreeWidgetItem::operator<(other);
 }
 
-CoinControlDialog::CoinControlDialog(const PlatformStyle *_platformStyle, QWidget *parent) :
+CoinControlDialog::CoinControlDialog(const QStyle *_platformStyle, QWidget *parent) :
     QDialog(parent),
     ui(new Ui::CoinControlDialog),
     model(0),
@@ -63,11 +62,17 @@ CoinControlDialog::CoinControlDialog(const PlatformStyle *_platformStyle, QWidge
 
     // context menu actions
     QAction *copyAddressAction = new QAction(tr("Copy address"), this);
+    copyAddressAction->setObjectName("action_coincontrol_copy_address");
     QAction *copyLabelAction = new QAction(tr("Copy label"), this);
+    copyLabelAction->setObjectName("action_coincontrol_copy_label");
     QAction *copyAmountAction = new QAction(tr("Copy amount"), this);
-             copyTransactionHashAction = new QAction(tr("Copy transaction ID"), this);  // we need to enable/disable this
-             lockAction = new QAction(tr("Lock unspent"), this);                        // we need to enable/disable this
-             unlockAction = new QAction(tr("Unlock unspent"), this);                    // we need to enable/disable this
+    copyAmountAction->setObjectName("action_coincontrol_copy_amount");
+    copyTransactionHashAction = new QAction(tr("Copy transaction ID"), this);  // we need to enable/disable this
+    copyTransactionHashAction->setObjectName("action_coincontrol_copy_transaction_hash");
+    lockAction = new QAction(tr("Lock unspent"), this);                        // we need to enable/disable this
+    lockAction->setObjectName("action_coincontrol_lock_unspent");
+    unlockAction = new QAction(tr("Unlock unspent"), this);                    // we need to enable/disable this
+    unlockAction->setObjectName("action_coincontrol_unlock_unspent");
 
     // context menu
     contextMenu = new QMenu(this);
@@ -90,12 +95,19 @@ CoinControlDialog::CoinControlDialog(const PlatformStyle *_platformStyle, QWidge
 
     // clipboard actions
     QAction *clipboardQuantityAction = new QAction(tr("Copy quantity"), this);
+    clipboardQuantityAction->setObjectName("action_coincontrol_clipboard_copy_quantity");
     QAction *clipboardAmountAction = new QAction(tr("Copy amount"), this);
+    clipboardAmountAction->setObjectName("action_coincontrol_clipboard_copy_amount");
     QAction *clipboardFeeAction = new QAction(tr("Copy fee"), this);
+    clipboardFeeAction->setObjectName("action_coincontrol_clipboard_copy_fee");
     QAction *clipboardAfterFeeAction = new QAction(tr("Copy after fee"), this);
+    clipboardAfterFeeAction->setObjectName("action_coincontrol_clipboard_copy_after_fee");
     QAction *clipboardBytesAction = new QAction(tr("Copy bytes"), this);
+    clipboardBytesAction->setObjectName("action_coincontrol_clipboard_copy_bytes");
     QAction *clipboardLowOutputAction = new QAction(tr("Copy dust"), this);
+    clipboardLowOutputAction->setObjectName("action_coincontrol_clipboard_copy_dust");
     QAction *clipboardChangeAction = new QAction(tr("Copy change"), this);
+    clipboardChangeAction->setObjectName("action_coincontrol_clipboard_copy_change");
 
     connect(clipboardQuantityAction, SIGNAL(triggered()), this, SLOT(clipboardQuantity()));
     connect(clipboardAmountAction, SIGNAL(triggered()), this, SLOT(clipboardAmount()));
@@ -283,7 +295,7 @@ void CoinControlDialog::lockCoin()
     COutPoint outpt(uint256S(contextMenuItem->text(COLUMN_TXHASH).toStdString()), contextMenuItem->text(COLUMN_VOUT_INDEX).toUInt());
     model->lockCoin(outpt);
     contextMenuItem->setDisabled(true);
-    contextMenuItem->setIcon(COLUMN_CHECKBOX, platformStyle->SingleColorIcon(":/icons/lock_closed"));
+    //contextMenuItem->setIcon(COLUMN_CHECKBOX, platformStyle->SingleColorIcon(":/icons/lock_closed"));
     updateLabelLocked();
 }
 
@@ -728,7 +740,7 @@ void CoinControlDialog::updateView(CAccount* forAccount)
                 COutPoint outpt(txhash, out.i);
                 coinControl->UnSelect(outpt); // just to be sure
                 itemOutput->setDisabled(true);
-                itemOutput->setIcon(COLUMN_CHECKBOX, platformStyle->SingleColorIcon(":/icons/lock_closed"));
+                //itemOutput->setIcon(COLUMN_CHECKBOX, platformStyle->SingleColorIcon(":/icons/lock_closed"));
             }
 
             // set checkbox

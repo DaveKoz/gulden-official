@@ -9,6 +9,7 @@
 #include "util.h"
 
 #include <windows.h>
+#include "unity/appmanager.h"
 
 #include <QDebug>
 
@@ -38,7 +39,8 @@ bool WinShutdownMonitor::nativeEventFilter(const QByteArray &eventType, void *pM
            {
                // Initiate a client shutdown after receiving a WM_QUERYENDSESSION and block
                // Windows session end until we have finished client shutdown.
-               StartShutdown();
+               LogPrintf("%s: Handling WM_QUERYENDSESSION.\n", __func__);
+               GuldenAppManager::gApp->shutdown();
                *pnResult = FALSE;
                return true;
            }

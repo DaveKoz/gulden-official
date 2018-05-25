@@ -29,7 +29,7 @@
 class AddressTableModel;
 class AccountTableModel;
 class OptionsModel;
-class PlatformStyle;
+class QStyle;
 class RecentRequestsTableModel;
 class TransactionTableModel;
 class WalletModelTransaction;
@@ -139,7 +139,7 @@ class WalletModel : public QObject
     Q_OBJECT
 
 public:
-    explicit WalletModel(const PlatformStyle *platformStyle, CWallet *wallet, OptionsModel *optionsModel, QObject *parent = 0);
+    explicit WalletModel(const QStyle *platformStyle, CWallet *wallet, OptionsModel *optionsModel, QObject *parent = 0);
     ~WalletModel();
 
     enum StatusCode // Returned by sendCoins
@@ -325,7 +325,8 @@ Q_SIGNALS:
     void notifyWatchonlyChanged(bool fHaveWatchonly);
 
     void activeAccountChanged(CAccount* account);
-    void accountListChanged();
+    void accountNameChanged(CAccount* account);
+    void accountWarningChanged(CAccount* account);
     void accountAdded(CAccount* account);
     void accountDeleted(CAccount* account);
 

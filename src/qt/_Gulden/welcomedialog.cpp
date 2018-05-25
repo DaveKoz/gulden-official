@@ -5,8 +5,8 @@
 
 #include "welcomedialog.h"
 #include <qt/_Gulden/forms/ui_welcomedialog.h>
-#include <Gulden/guldenapplication.h>
-#include "GuldenGUI.h"
+#include <unity/appmanager.h>
+#include "gui.h"
 #include <wallet/wallet.h>
 #include "ui_interface.h"
 #include <QMovie>
@@ -32,7 +32,7 @@ static void ShowProgress(WelcomeDialog* welcomeDialog, const std::string &messag
         );
 }
 
-WelcomeDialog::WelcomeDialog(const PlatformStyle* _platformStyle, QWidget* parent)
+WelcomeDialog::WelcomeDialog(const QStyle* _platformStyle, QWidget* parent)
 : QFrame( parent )
 , ui( new Ui::WelcomeDialog )
 , platformStyle( _platformStyle )
@@ -112,9 +112,9 @@ void WelcomeDialog::newWallet()
 {
     std::vector<unsigned char> entropy(16);
     GetStrongRandBytes(&entropy[0], 16);
-    GuldenApplication::gApp->setRecoveryPhrase(mnemonicFromEntropy(entropy, entropy.size()*8));
+    GuldenAppManager::gApp->setRecoveryPhrase(mnemonicFromEntropy(entropy, entropy.size()*8));
 
-    ui->edittextEnterRecoveryPhrase->setText(QString::fromStdString(GuldenApplication::gApp->getRecoveryPhrase().c_str()));
+    ui->edittextEnterRecoveryPhrase->setText(QString::fromStdString(GuldenAppManager::gApp->getRecoveryPhrase().c_str()));
     ui->edittextEnterRecoveryPhrase->setReadOnly(true);
     ui->checkboxConfirmRecoveryPhraseWrittenDown->setVisible(true);
     ui->checkboxConfirmRecoveryPhraseWrittenDown->setChecked(false);
@@ -124,7 +124,7 @@ void WelcomeDialog::newWallet()
     ui->labelEnterRecoveryPhrase->setVisible(false);
     ui->welcomeDialogActionStack->setCurrentWidget(ui->welcomeDialogRecoverWalletPage);
 
-    GuldenApplication::gApp->isRecovery = false;
+    GuldenAppManager::gApp->isRecovery = false;
 }
 
 void WelcomeDialog::recoverWallet()
@@ -137,7 +137,7 @@ void WelcomeDialog::recoverWallet()
     ui->labelEnterRecoveryPhrase->setVisible(true);
     ui->welcomeDialogActionStack->setCurrentWidget(ui->welcomeDialogRecoverWalletPage);
 
-    GuldenApplication::gApp->isRecovery = true;
+    GuldenAppManager::gApp->isRecovery = true;
 }
 
 void WelcomeDialog::processRecoveryPhrase()
@@ -152,7 +152,7 @@ void WelcomeDialog::processRecoveryPhrase()
         if (recoveryPhrase.isEmpty() || recoveryPhrase.length() < 16)
         {
             QString message = tr("Please enter a recovery phrase");
-            QDialog* d = GuldenGUI::createDialog(this, message, "Okay", "", 400, 180);
+            QDialog* d = GUI::createDialog(this, message, "Okay", "", 400, 180);
             d->exec();
             return;
         }
@@ -162,7 +162,7 @@ void WelcomeDialog::processRecoveryPhrase()
             if (!checkMnemonic(recoveryPhrase.toStdString().c_str()))
             {
                 QString message = tr("The recovery phrase you have entered is not a valid Gulden recovery phrase, if you are sure that this is your phrase then the program can attempt to use it, note that it will be used exactly as is so no double spacing or any other correction will be performed. Making up your own phrase can greatly reduce security, no support can be offered for invalid phrases.");
-                QDialog* d = GuldenGUI::createDialog(this, message, tr("Cancel"), tr("Proceed with invalid phrase"), 400, 180);
+                QDialog* d = GUI::createDialog(this, message, tr("Cancel"), tr("Proceed with invalid phrase"), 400, 180);
 
                 int result = d->exec();
                 if(result == QDialog::Accepted)
@@ -173,7 +173,7 @@ void WelcomeDialog::processRecoveryPhrase()
                 recoveryPhrase = ui->edittextEnterRecoveryPhrase->toPlainText();
             }
 
-            GuldenApplication::gApp->setRecoveryPhrase(recoveryPhrase.toStdString().c_str());
+            GuldenAppManager::gApp->setRecoveryPhrase(recoveryPhrase.toStdString().c_str());
 
             //Try burn memory - just in case - not guaranteed to work everywhere but better than doing nothing.
             burnTextEditMemory(ui->edittextEnterRecoveryPhrase);
@@ -191,7 +191,7 @@ void WelcomeDialog::processRecoveryPhrase()
     else
     {
         QString message = tr("Without your recovery phrase you will lose your Guldens when something goes wrong with your computer.");
-        QDialog* d = GuldenGUI::createDialog(this, message, tr("I understand"), "", 640, 180);
+        QDialog* d = GUI::createDialog(this, message, tr("I understand"), "", 640, 180);
         d->exec();
     }
 }

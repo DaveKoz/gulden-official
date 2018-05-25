@@ -18,7 +18,6 @@
 #include "guiutil.h"
 #include "optionsmodel.h"
 #include "overviewpage.h"
-#include "platformstyle.h"
 #include "qt/_Gulden/receivecoinsdialog.h"
 #include "qt/_Gulden/witnessdialog.h"
 #include "sendcoinsdialog.h"
@@ -43,7 +42,7 @@
 
 
 
-WalletView::WalletView(const PlatformStyle *_platformStyle, QWidget *parent):
+WalletView::WalletView(const QStyle *_platformStyle, QWidget *parent):
     QStackedWidget(parent),
     clientModel(0),
     walletModel(0),
@@ -64,10 +63,10 @@ WalletView::WalletView(const PlatformStyle *_platformStyle, QWidget *parent):
     vbox->addWidget(transactionView,6);
     QPushButton *exportButton = new QPushButton(tr("&Export"), this);
     exportButton->setVisible(false);
-    exportButton->setToolTip(tr("Export the data in the current tab to a file"));
+    /*exportButton->setToolTip(tr("Export the data in the current tab to a file"));
     if (platformStyle->getImagesOnButtons()) {
         exportButton->setIcon(platformStyle->SingleColorIcon(":/icons/export"));
-    }
+    }*/
     hbox_buttons->addStretch();
     hbox_buttons->addWidget(exportButton);
     vbox->addLayout(hbox_buttons);
@@ -180,6 +179,7 @@ void WalletView::setWalletModel(WalletModel *_walletModel)
     }
 }
 
+
 void WalletView::processNewTransaction(const QModelIndex& parent, int start, int end)
 {
     // Prevent balloon-spam when initial block download is in progress
@@ -201,21 +201,21 @@ void WalletView::processNewTransaction(const QModelIndex& parent, int start, int
         QString label = ttm->data(index, TransactionTableModel::LabelRole).toString();
 
 
-        boost::uuids::uuid accountUUID = getUUIDFromString(ttm->data(index, TransactionTableModel::AccountRole).toString().toStdString());
+        boost::uuids::uuid accountUUID = ttm->data(index, TransactionTableModel::AccountRole).value<boost::uuids::uuid>();
         if (fShowChildAccountsSeperately)
         {
-            QString accountParentUUID = ttm->data(index, TransactionTableModel::AccountParentRole).toString();
-            if (!accountParentUUID.isEmpty())
-                accountUUID = getUUIDFromString(accountParentUUID.toStdString());
+            boost::uuids::uuid accountParentUUID = ttm->data(index, TransactionTableModel::AccountParentRole).value<boost::uuids::uuid>();
+            if (accountParentUUID != boost::uuids::nil_generator()())
+                accountUUID = accountParentUUID;
         }
 
-        QString account;
+        QString accountLabel;
         if(accountUUID != boost::uuids::nil_generator()())
         {
-            account = walletModel->getAccountLabel(accountUUID);
+            accountLabel = walletModel->getAccountLabel(accountUUID);
         }
 
-        Q_EMIT incomingTransaction(date, walletModel->getOptionsModel()->getDisplayUnit(), amountReceived, amountSent, type, address, account, label);
+        Q_EMIT incomingTransaction(date, walletModel->getOptionsModel()->getDisplayUnit(), amountReceived, amountSent, type, address, accountLabel, label);
     }
 }
 

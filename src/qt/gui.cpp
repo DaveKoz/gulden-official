@@ -4,7 +4,7 @@
 //
 // File contains modifications by: The Gulden developers
 // All modifications:
-// Copyright (c) 2016-2018 The Gulden developers
+// Copyright (c) 2015-2018 The Gulden developers
 // Authored by: Malcolm MacLeod (mmacleod@webmail.co.za)
 // Distributed under the GULDEN software license, see the accompanying
 // file COPYING
@@ -14,6 +14,7 @@
 #endif
 
 #include "gui.h"
+#include <unity/appmanager.h>
 
 #include "units.h"
 #include "clientmodel.h"
@@ -25,13 +26,13 @@
 #include "openuridialog.h"
 #include "optionsdialog.h"
 #include "optionsmodel.h"
-#include "platformstyle.h"
 #include "rpcconsole.h"
 #include "utilitydialog.h"
 #include "checkpoints.h"
 #include "chainparams.h"
 #include "transactiontablemodel.h"
 #include "transactionrecord.h"
+#include "qt/_Gulden/exchangeratedialog.h"
 
 #ifdef ENABLE_WALLET
 #include "walletframe.h"
@@ -98,160 +99,43 @@ const std::string GUI::DEFAULT_UIPLATFORM =
 #endif
         ;
 
-#ifdef ENABLE_WALLET
-//fixme: (2.1) - Some of this is redundant and can possibly be removed; as we set a lot of therse states now from within ::AddToWalletIfInvolvingMe
-//However - we would have to update account serialization to serialist the warning state and/or test some things before removing this.
-static void UpdateWitnessAccountStates(WalletModel* model)
+static void NotifyRequestUnlockS(GUI* parent, CWallet* wallet, std::string reason)
 {
-    static uint64_t nUpdateTimerStart = 0;
-    // Only update at most once every 60 seconds (prevent this from being a bottleneck on testnet)
-    if (nUpdateTimerStart == 0 || (GetTimeMillis() - nUpdateTimerStart > IsArgSet("-testnet") ? 60000 : 10000))
-    {
-        if (chainActive.Tip() && chainActive.Tip()->pprev)
-        {
-            LOCK(cs_main); // Required for ReadBlockFromDisk as well as account access.
-            nUpdateTimerStart = GetTimeMillis();
-
-            std::unique_ptr<TransactionFilterProxy> filter;
-            filter.reset(new TransactionFilterProxy);
-            filter->setSourceModel(model->getTransactionTableModel());
-            filter->setDynamicSortFilter(true);
-            filter->setSortRole(Qt::EditRole);
-            filter->setShowInactive(false);
-            filter->sort(TransactionTableModel::Date, Qt::AscendingOrder);
-
-            CGetWitnessInfo witnessInfo;
-            CBlock block;
-            //fixme: (2.0) Error handling.
-            if (!ReadBlockFromDisk(block, chainActive.Tip(), Params().GetConsensus()))
-                return;
-            if (!GetWitnessInfo(chainActive, Params(), nullptr, chainActive.Tip()->pprev, block, witnessInfo, chainActive.Tip()->nHeight))
-                return;
-
-            LOCK(pactiveWallet->cs_wallet);
-
-            for ( const auto& accountPair : pactiveWallet->mapAccounts )
-            {
-                AccountStatus prevState = accountPair.second->GetWarningState();
-                AccountStatus newState = AccountStatus::Default;
-                bool bAnyAreMine = false;
-                for (const auto& witCoin : witnessInfo.witnessSelectionPoolUnfiltered)
-                {
-                    if (IsMine(*accountPair.second, witCoin.coin.out))
-                    {
-                        bAnyAreMine = true;
-                        CTxOutPoW2Witness details;
-                        GetPow2WitnessOutput(witCoin.coin.out, details);
-                        if (details.lockUntilBlock < (unsigned int)chainActive.Tip()->nHeight)
-                        {
-                            newState = AccountStatus::WitnessEnded;
-                        }
-                        else if (witnessHasExpired(witCoin.nAge, witCoin.nWeight, witnessInfo.nTotalWeight))
-                        {
-                            newState = AccountStatus::WitnessExpired;
-
-                            // Due to lock changing cached balance for certain transactions will now be invalidated.
-                            // Technically we should find those specific transactions and invalidate them, but it's simpler to just invalidate them all.
-                            if (prevState != AccountStatus::WitnessExpired)
-                            {
-                                for(auto& wtxIter : pactiveWallet->mapWallet)
-                                {
-                                    wtxIter.second.clearAllCaches();
-                                }
-                            }
-                        }
-                    }
-                }
-                if (!bAnyAreMine)
-                {
-                    newState = AccountStatus::WitnessEmpty;
-                    filter->setAccountFilter(accountPair.second);
-                    int rows = filter->rowCount();
-                    for (int row = 0; row < rows; ++row)
-                    {
-                        QModelIndex index = filter->index(row, 0);
-
-                        int nStatus = filter->data(index, TransactionTableModel::StatusRole).toInt();
-                        if (nStatus == TransactionStatus::Status::Unconfirmed)
-                        {
-                            newState = AccountStatus::WitnessPending;
-                            break;
-                        }
-                    }
-                }
-                if (newState != prevState)
-                {
-                    accountPair.second->SetWarningState(newState);
-                    static_cast<const CGuldenWallet*>(pactiveWallet)->NotifyAccountWarningChanged(pactiveWallet, accountPair.second);
-                }
-            }
-        }
-    }
+    QMetaObject::invokeMethod(parent, "NotifyRequestUnlock", Qt::QueuedConnection, Q_ARG(void*, wallet), Q_ARG(QString, QString::fromStdString(reason)));
 }
 
-void GUI::updateUIForBlockTipChange()
+static void NotifyRequestUnlockWithCallbackS(GUI* parent, CWallet* wallet, std::string reason, std::function<void (void)> callback)
 {
-    if (walletFrame && walletFrame->currentWalletView())
-        UpdateWitnessAccountStates( walletFrame->currentWalletView()->walletModel );
+    QMetaObject::invokeMethod(parent, "NotifyRequestUnlockWithCallback", Qt::QueuedConnection, Q_ARG(void*, wallet), Q_ARG(QString, QString::fromStdString(reason)), Q_ARG(std::function<void (void)>, callback));
 }
-static void BlockTipChangedHandler(GUI* pUI, bool ibd, const CBlockIndex *)
-{
-    QMetaObject::invokeMethod( pUI, "updateWitnessDialog", Qt::QueuedConnection );
-    if (pUI)
-        pUI->updateUIForBlockTipChange();
-}
-#endif
 
 /** Display name for default wallet name. Uses tilde to avoid name
  * collisions in the future with additional wallets */
 const QString GUI::DEFAULT_WALLET = "~Default";
 
-GUI::GUI(const PlatformStyle *_platformStyle, const NetworkStyle *networkStyle, QWidget *parent) :
-    QMainWindow(parent),
-    enableWallet(false),
-    walletFrame(0),
-    clientModel(0),
-    unitDisplayControl(0),
-    labelWalletEncryptionIcon(0),
-    labelWalletHDStatusIcon(0),
-    connectionsControl(0),
-    labelBlocksIcon(0),
-    progressBarLabel(0),
-    progressBar(0),
-    progressDialog(0),
-    appMenuBar(0),
-    witnessDialogAction ( nullptr ),
-    overviewAction(0),
-    historyAction(0),
-    quitAction(0),
-    sendCoinsAction(0),
-    sendCoinsMenuAction(0),
-    usedSendingAddressesAction(0),
-    usedReceivingAddressesAction(0),
-    aboutAction(0),
-    receiveCoinsAction(0),
-    receiveCoinsMenuAction(0),
-    optionsAction(0),
-    toggleHideAction(0),
-    encryptWalletAction(0),
-    backupWalletAction(0),
-    changePassphraseAction(0),
-    aboutQtAction(0),
-    openRPCConsoleAction(0),
-    openAction(0),
-    showHelpMessageAction(0),
-    trayIcon(0),
-    trayIconMenu(0),
-    notificator(0),
-    rpcConsole(0),
-    helpMessageDialog(0),
-    modalOverlay(0),
-    accountSummaryWidget( nullptr ),
-    prevBlocks(0),
-    spinnerFrame(0),
-    platformStyle(_platformStyle),
-    m_pGuldenImpl(new GuldenGUI(this))
+GUI::GUI(const QStyle *_platformStyle, const NetworkStyle *networkStyle, QWidget *parent)
+: QMainWindow(parent)
+, platformStyle(_platformStyle)
 {
+    // Delete ourselves on close, application catches this and uses it as a signal to exit.
+    setAttribute(Qt::WA_DeleteOnClose, true);
+
+    //fixme: (2.1) ex GuldenGUI code, integrate this better
+    {
+        ticker = new CurrencyTicker( this );
+        nocksSettings = new NocksSettings( this );
+
+        //Start the ticker polling off - after the initial call the ticker will schedule the subsequent ones internally.
+        ticker->pollTicker();
+        nocksSettings->pollSettings();
+
+        connect( ticker, SIGNAL( exchangeRatesUpdated() ), this, SLOT( updateExchangeRates() ) );
+
+        uiInterface.RequestUnlock.connect(boost::bind(NotifyRequestUnlockS, this, _1, _2));
+        uiInterface.RequestUnlockWithCallback.connect(boost::bind(NotifyRequestUnlockWithCallbackS, this, _1, _2, _3));
+    }
+
+
     #if QT_VERSION > 0x050100
     // Generate high-dpi pixmaps
     QApplication::setAttribute(Qt::AA_UseHighDpiPixmaps);
@@ -290,6 +174,7 @@ GUI::GUI(const PlatformStyle *_platformStyle, const NetworkStyle *networkStyle, 
     } else {
         windowTitle += tr("Node");
     }
+    enableFullUI = !GetBoolArg("-disableui", false);
     windowTitle += " " + networkStyle->getTitleAddText();
 #ifndef Q_OS_MAC
     QApplication::setWindowIcon(networkStyle->getTrayAndWindowIcon());
@@ -308,7 +193,7 @@ GUI::GUI(const PlatformStyle *_platformStyle, const NetworkStyle *networkStyle, 
     rpcConsole = new RPCConsole(_platformStyle, 0);
     helpMessageDialog = new HelpMessageDialog(this, false);
 #ifdef ENABLE_WALLET
-    if(enableWallet)
+    if(enableWallet && enableFullUI)
     {
         /** Create wallet frame and make it the central widget */
         walletFrame = new WalletFrame(_platformStyle, this);
@@ -320,6 +205,8 @@ GUI::GUI(const PlatformStyle *_platformStyle, const NetworkStyle *networkStyle, 
          * the central widget is the rpc console.
          */
         setCentralWidget(rpcConsole);
+        // Call back to initialize as otherwise we have no f unctionality.
+        QMetaObject::invokeMethod(QApplication::instance(), "requestInitialize", Qt::QueuedConnection);
     }
 
     // Accept D&D of URIs
@@ -345,21 +232,19 @@ GUI::GUI(const PlatformStyle *_platformStyle, const NetworkStyle *networkStyle, 
     statusBar()->setSizeGripEnabled(false);
 
     // Status bar notification icons
-    frameBlocks = new QFrame();
+    frameBlocks = new QFrame(this);
     frameBlocks->setContentsMargins(0,0,0,0);
     frameBlocks->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
     QHBoxLayout *frameBlocksLayout = new QHBoxLayout(frameBlocks);
     frameBlocksLayout->setContentsMargins(3,0,3,0);
     frameBlocksLayout->setSpacing(3);
-    unitDisplayControl = new UnitDisplayStatusBarControl(platformStyle);
-    labelWalletEncryptionIcon = new QLabel();
-    labelWalletHDStatusIcon = new QLabel();
+    labelWalletEncryptionIcon = new QLabel(this);
+    labelWalletHDStatusIcon = new QLabel(this);
     connectionsControl = new GUIUtil::ClickableLabel();
     labelBlocksIcon = new GUIUtil::ClickableLabel();
-    if(enableWallet)
+    if(enableWallet && enableFullUI)
     {
         //frameBlocksLayout->addStretch();
-        frameBlocksLayout->addWidget(unitDisplayControl);
         //frameBlocksLayout->addStretch();
         frameBlocksLayout->addWidget(labelWalletEncryptionIcon);
         frameBlocksLayout->addWidget(labelWalletHDStatusIcon);
@@ -372,7 +257,7 @@ GUI::GUI(const PlatformStyle *_platformStyle, const NetworkStyle *networkStyle, 
 
     // Progress bar and label for blocks download
     progressBarLabel = new QLabel();
-    m_pGuldenImpl->hideProgressBarLabel();
+    hideProgressBarLabel();
     progressBarLabel->setVisible(false);
     progressBar = new GUIUtil::ProgressBar();
     progressBar->setAlignment(Qt::AlignCenter);
@@ -402,10 +287,10 @@ GUI::GUI(const PlatformStyle *_platformStyle, const NetworkStyle *networkStyle, 
 
     connect(connectionsControl, SIGNAL(clicked(QPoint)), this, SLOT(toggleNetworkActive()));
 
-    m_pGuldenImpl->doPostInit();
+    doPostInit();
     modalOverlay = new ModalOverlay(this->centralWidget());
 #ifdef ENABLE_WALLET
-    if(enableWallet) {
+    if(enableWallet && enableFullUI) {
         connect(walletFrame, SIGNAL(requestedSyncWarningInfo()), this, SLOT(showModalOverlay()));
         connect(labelBlocksIcon, SIGNAL(clicked(QPoint)), this, SLOT(showModalOverlay()));
         connect(progressBar, SIGNAL(clicked(QPoint)), this, SLOT(showModalOverlay()));
@@ -413,61 +298,94 @@ GUI::GUI(const PlatformStyle *_platformStyle, const NetworkStyle *networkStyle, 
 #endif
 }
 
+void GUI::disconnectNonEssentialSignals()
+{
+    disconnect( ticker, SIGNAL( exchangeRatesUpdated() ), this, SLOT( updateExchangeRates() ) );
+    if (dialogExchangeRate)
+        dialogExchangeRate->disconnectSlots();
+    if (accountSummaryWidget)
+        accountSummaryWidget->disconnectSlots();
+}
+
 GUI::~GUI()
 {
+    LogPrint(BCLog::QT, "GUI::~GUI\n");
+
+    // Delete items that respond to timers
+    delete ticker;
+    delete nocksSettings;
+
     // Unsubscribe from notifications from core
     unsubscribeFromCoreSignals();
 
+    if (rpcConsole)
+    {
+        delete rpcConsole;
+        rpcConsole = nullptr;
+    }
+
+    // Save window size and position for future loads.
     GUIUtil::saveWindowGeometry("nWindow", this);
-    if(trayIcon) // Hide tray icon, as deleting will let it linger until quit (on Ubuntu)
+
+    // Hide tray icon, as deleting will let it linger until quit (on Ubuntu)
+    if(trayIcon) 
         trayIcon->hide();
+
 #ifdef Q_OS_MAC
     delete appMenuBar;
     MacDockIconHandler::cleanup();
 #endif
-
-    delete rpcConsole;
 }
 
 void GUI::createActions()
 {
-    QActionGroup *tabGroup = new QActionGroup(this);
+    LogPrint(BCLog::QT, "GUI::createActions\n");
 
-    witnessDialogAction = new QAction(platformStyle->TextColorIcon(":/icons/options"), tr("&Overview"), this);
+    QActionGroup *tabGroup = new QActionGroup(this);
+    tabGroup->setObjectName("gui_action_tab_group");
+
+    witnessDialogAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf1fe), tr("&Overview"), this);
+    witnessDialogAction->setObjectName("action_witness_dialog");
     witnessDialogAction->setStatusTip(tr("View statistics and information for witness account."));
     witnessDialogAction->setCheckable(true);
     tabGroup->addAction(witnessDialogAction);
 
-    overviewAction = new QAction(platformStyle->SingleColorIcon(":/icons/overview"), tr("&Overview"), this);
+    overviewAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf1fe), tr("&Overview"), this);
+    overviewAction->setObjectName("action_overview");
     overviewAction->setStatusTip(tr("Show general overview of wallet"));
     overviewAction->setToolTip(overviewAction->statusTip());
     overviewAction->setCheckable(true);
     overviewAction->setShortcut(QKeySequence(Qt::ALT + Qt::Key_1));
     tabGroup->addAction(overviewAction);
 
-    sendCoinsAction = new QAction(platformStyle->SingleColorIcon(":/icons/send"), tr("&Send"), this);
+    sendCoinsAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf2f5), tr("&Send"), this);
+    sendCoinsAction->setObjectName("action_send_coins");
     sendCoinsAction->setStatusTip(tr("Send coins to a Gulden address"));
     sendCoinsAction->setToolTip(sendCoinsAction->statusTip());
     sendCoinsAction->setCheckable(true);
     sendCoinsAction->setShortcut(QKeySequence(Qt::ALT + Qt::Key_2));
     tabGroup->addAction(sendCoinsAction);
 
-    sendCoinsMenuAction = new QAction(platformStyle->TextColorIcon(":/icons/send"), sendCoinsAction->text(), this);
+    sendCoinsMenuAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf2f5), tr("&Send"), this);
+    sendCoinsMenuAction->setObjectName("action_send_coins_menu");
     sendCoinsMenuAction->setStatusTip(sendCoinsAction->statusTip());
     sendCoinsMenuAction->setToolTip(sendCoinsMenuAction->statusTip());
 
-    receiveCoinsAction = new QAction(platformStyle->SingleColorIcon(":/icons/receiving_addresses"), tr("&Receive"), this);
+    receiveCoinsAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf2f6), tr("&Receive"), this);
+    receiveCoinsAction->setObjectName("action_receive_coins");
     receiveCoinsAction->setStatusTip(tr("Request payments (generates QR codes and gulden: URIs)"));
     receiveCoinsAction->setToolTip(receiveCoinsAction->statusTip());
     receiveCoinsAction->setCheckable(true);
     receiveCoinsAction->setShortcut(QKeySequence(Qt::ALT + Qt::Key_3));
     tabGroup->addAction(receiveCoinsAction);
 
-    receiveCoinsMenuAction = new QAction(platformStyle->TextColorIcon(":/icons/receiving_addresses"), receiveCoinsAction->text(), this);
+    receiveCoinsMenuAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf2f6), tr("&Receive"), this);
+    receiveCoinsMenuAction->setObjectName("action_receive_menu");
     receiveCoinsMenuAction->setStatusTip(receiveCoinsAction->statusTip());
     receiveCoinsMenuAction->setToolTip(receiveCoinsMenuAction->statusTip());
 
-    historyAction = new QAction(platformStyle->SingleColorIcon(":/icons/history"), tr("&Transactions"), this);
+    historyAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf362), tr("&Transactions"), this);
+    historyAction->setObjectName("action_history");
     historyAction->setStatusTip(tr("Browse transaction history"));
     historyAction->setToolTip(historyAction->statusTip());
     historyAction->setCheckable(true);
@@ -493,53 +411,90 @@ void GUI::createActions()
     connect(historyAction, SIGNAL(triggered()), this, SLOT(gotoHistoryPage()));
 #endif // ENABLE_WALLET
 
-    quitAction = new QAction(platformStyle->TextColorIcon(":/icons/quit"), tr("E&xit"), this);
+    toggleHideAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf070), tr("&Show / Hide"), this);
+    toggleHideAction->setObjectName("action_toggle_hide");
+    toggleHideAction->setStatusTip(tr("Show or hide the main Window"));
+
+    importPrivateKeyAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf019), tr("&Import key"), this);
+    importPrivateKeyAction->setObjectName("action_import_privkey");
+    importPrivateKeyAction->setStatusTip(tr("Import a private key address"));
+    importPrivateKeyAction->setCheckable(false);
+
+    rescanAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf002), tr("&Rescan transactions"), this);
+    rescanAction->setObjectName("action_rescan");
+    rescanAction->setStatusTip(tr("Rescan the blockchain looking for any missing transactions"));
+    rescanAction->setCheckable(false);
+
+    openAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf35d), tr("Open &URI..."), this);
+    openAction->setObjectName("action_open_uri");
+    openAction->setStatusTip(tr("Open a gulden: URI or payment request"));
+
+    backupWalletAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf0c7), tr("&Backup Wallet..."), this);
+    backupWalletAction->setObjectName("action_backup_wallet");
+    backupWalletAction->setStatusTip(tr("Backup wallet to another location"));
+
+    usedSendingAddressesAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf2f5), tr("&Sending addresses..."), this);
+    usedSendingAddressesAction->setObjectName("action_used_sending_addresses");
+    usedSendingAddressesAction->setStatusTip(tr("Show the list of used sending addresses and labels"));
+
+    usedReceivingAddressesAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf2f6), tr("&Receiving addresses..."), this);
+    usedReceivingAddressesAction->setObjectName("action_used_receiving_addresses");
+    usedReceivingAddressesAction->setStatusTip(tr("Show the list of used receiving addresses and labels"));
+
+    quitAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf057), tr("E&xit"), this);
+    quitAction->setObjectName("action_quit");
     quitAction->setStatusTip(tr("Quit application"));
     quitAction->setShortcut(QKeySequence(Qt::CTRL + Qt::Key_Q));
     quitAction->setMenuRole(QAction::QuitRole);
-    aboutAction = new QAction(platformStyle->TextColorIcon(":/icons/about"), tr("&About %1").arg(tr(PACKAGE_NAME)), this);
+
+    openRPCConsoleAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf390), tr("&Debug window"), this);
+    openRPCConsoleAction->setObjectName("action_open_rpc_console");
+    openRPCConsoleAction->setStatusTip(tr("Open debugging and diagnostic console"));
+    openRPCConsoleAction->setEnabled(false); // initially disable the debug window menu item
+
+    showHelpMessageAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf120), tr("&Command-line options"), this);
+    showHelpMessageAction->setObjectName("action_show_help_message");
+    showHelpMessageAction->setMenuRole(QAction::NoRole);
+    showHelpMessageAction->setStatusTip(tr("Show the %1 help message to get a list with possible Gulden command-line options").arg(tr(PACKAGE_NAME)));
+
+    aboutAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf05a), tr("&About %1").arg(tr(PACKAGE_NAME)), this);
+    aboutAction->setObjectName("action_about");
     aboutAction->setStatusTip(tr("Show information about %1").arg(tr(PACKAGE_NAME)));
     aboutAction->setMenuRole(QAction::AboutRole);
+
     aboutAction->setEnabled(false);
-    aboutQtAction = new QAction(platformStyle->TextColorIcon(":/icons/about_qt"), tr("About &Qt"), this);
+    aboutQtAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf05a), tr("About &Qt"), this);
+    aboutQtAction->setObjectName("action_about_qt");
     aboutQtAction->setStatusTip(tr("Show information about Qt"));
     aboutQtAction->setMenuRole(QAction::AboutQtRole);
-    optionsAction = new QAction(platformStyle->TextColorIcon(":/icons/options"), tr("&Options..."), this);
+
+    encryptWalletAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf30d), tr("&Encrypt Wallet..."), this);
+    encryptWalletAction->setObjectName("action_encrypt_wallet");
+    encryptWalletAction->setStatusTip(tr("Encrypt the private keys that belong to your wallet"));
+    encryptWalletAction->setCheckable(true);
+
+    changePassphraseAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf084), tr("&Change Passphrase..."), this);
+    changePassphraseAction->setObjectName("action_change_passphrase");
+    changePassphraseAction->setStatusTip(tr("Change the passphrase used for wallet encryption"));
+
+    optionsAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf085), tr("&Options..."), this);
+    optionsAction->setObjectName("action_options");
     optionsAction->setStatusTip(tr("Modify configuration options for %1").arg(tr(PACKAGE_NAME)));
     optionsAction->setMenuRole(QAction::PreferencesRole);
     optionsAction->setEnabled(false);
-    toggleHideAction = new QAction(platformStyle->TextColorIcon(":/icons/about"), tr("&Show / Hide"), this);
-    toggleHideAction->setStatusTip(tr("Show or hide the main Window"));
 
-    encryptWalletAction = new QAction(platformStyle->TextColorIcon(":/icons/lock_closed"), tr("&Encrypt Wallet..."), this);
-    encryptWalletAction->setStatusTip(tr("Encrypt the private keys that belong to your wallet"));
-    encryptWalletAction->setCheckable(true);
-    backupWalletAction = new QAction(platformStyle->TextColorIcon(":/icons/filesave"), tr("&Backup Wallet..."), this);
-    backupWalletAction->setStatusTip(tr("Backup wallet to another location"));
-    changePassphraseAction = new QAction(platformStyle->TextColorIcon(":/icons/key"), tr("&Change Passphrase..."), this);
-    changePassphraseAction->setStatusTip(tr("Change the passphrase used for wallet encryption"));
-
-    openRPCConsoleAction = new QAction(platformStyle->TextColorIcon(":/icons/debugwindow"), tr("&Debug window"), this);
-    openRPCConsoleAction->setStatusTip(tr("Open debugging and diagnostic console"));
-    // initially disable the debug window menu item
-    openRPCConsoleAction->setEnabled(false);
-
-    usedSendingAddressesAction = new QAction(platformStyle->TextColorIcon(":/icons/address-book"), tr("&Sending addresses..."), this);
-    usedSendingAddressesAction->setStatusTip(tr("Show the list of used sending addresses and labels"));
-    usedReceivingAddressesAction = new QAction(platformStyle->TextColorIcon(":/icons/address-book"), tr("&Receiving addresses..."), this);
-    usedReceivingAddressesAction->setStatusTip(tr("Show the list of used receiving addresses and labels"));
-
-    openAction = new QAction(platformStyle->TextColorIcon(":/icons/open"), tr("Open &URI..."), this);
-    openAction->setStatusTip(tr("Open a gulden: URI or payment request"));
-
-    showHelpMessageAction = new QAction(platformStyle->TextColorIcon(":/icons/info"), tr("&Command-line options"), this);
-    showHelpMessageAction->setMenuRole(QAction::NoRole);
-    showHelpMessageAction->setStatusTip(tr("Show the %1 help message to get a list with possible Gulden command-line options").arg(tr(PACKAGE_NAME)));
+    currencyAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf3d1), tr("&Select currency"), this);
+    currencyAction->setObjectName("action_currency");
+    currencyAction->setStatusTip(tr("Change the local currency that is used to display estimates"));
+    currencyAction->setCheckable(false);
 
     connect(quitAction, SIGNAL(triggered()), qApp, SLOT(quit()));
     connect(aboutAction, SIGNAL(triggered()), this, SLOT(aboutClicked()));
     connect(aboutQtAction, SIGNAL(triggered()), qApp, SLOT(aboutQt()));
     connect(optionsAction, SIGNAL(triggered()), this, SLOT(optionsClicked()));
+    connect(currencyAction, SIGNAL(triggered()), this, SLOT(showExchangeRateDialog()));
+    connect(importPrivateKeyAction, SIGNAL(triggered()), this, SLOT(promptImportPrivKey()));
+    connect(rescanAction, SIGNAL(triggered()), this, SLOT(promptRescan()));
     connect(toggleHideAction, SIGNAL(triggered()), this, SLOT(toggleHidden()));
     connect(showHelpMessageAction, SIGNAL(triggered()), this, SLOT(showHelpMessageClicked()));
     connect(openRPCConsoleAction, SIGNAL(triggered()), this, SLOT(showDebugWindow()));
@@ -564,6 +519,8 @@ void GUI::createActions()
 
 void GUI::createMenuBar()
 {
+    LogPrint(BCLog::QT, "GUI::createMenuBar\n");
+
 #ifdef Q_OS_MAC
     // Create a decoupled menu bar on Mac which stays even if the window is closed
     appMenuBar = new QMenuBar();
@@ -571,9 +528,11 @@ void GUI::createMenuBar()
     // Get the main window's menu bar on other platforms
     appMenuBar = menuBar();
 #endif
+    appMenuBar->setObjectName("menu_bar_app");
 
     // Configure the menus
     QMenu *file = appMenuBar->addMenu(tr("&File"));
+    file->setObjectName("menu_file");
     if(walletFrame)
     {
         file->addAction(openAction);
@@ -585,7 +544,8 @@ void GUI::createMenuBar()
     }
     file->addAction(quitAction);
 
-    settingsMenu = appMenuBar->addMenu(tr("&Settings"));
+    QMenu* settingsMenu = appMenuBar->addMenu(tr("&Settings"));
+    settingsMenu->setObjectName("menu_settings");
     if(walletFrame)
     {
         settingsMenu->addAction(encryptWalletAction);
@@ -593,10 +553,15 @@ void GUI::createMenuBar()
         settingsMenu->addSeparator();
     }
     settingsMenu->addAction(optionsAction);
+    settingsMenu->addAction(currencyAction);
 
-    m_pGuldenImpl->createMenusGulden();
+    QMenu* toolsMenu = appMenuBar->addMenu(tr("&Tools"));
+    toolsMenu->setObjectName("menu_tools");
+    toolsMenu->addAction(importPrivateKeyAction);
+    toolsMenu->addAction(rescanAction);
 
-    QMenu *help = appMenuBar->addMenu(tr("&Help"));
+    QMenu* help = appMenuBar->addMenu(tr("&Help"));
+    help->setObjectName("menu_help");
     if(walletFrame)
     {
         help->addAction(openRPCConsoleAction);
@@ -607,26 +572,10 @@ void GUI::createMenuBar()
     help->addAction(aboutQtAction);
 }
 
-void GUI::createToolBars()
-{
-    if(walletFrame)
-    {
-        QToolBar* toolbar = addToolBar(tr("Tabs toolbar"));
-        toolbar->setMovable(false);
-        toolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-        toolbar->addAction(witnessDialogAction);
-        toolbar->addAction(overviewAction);
-        toolbar->addAction(sendCoinsAction);
-        toolbar->addAction(receiveCoinsAction);
-        toolbar->addAction(historyAction);
-        overviewAction->setChecked(true);
-
-        m_pGuldenImpl->createToolBarsGulden();
-    }
-}
-
 void GUI::setClientModel(ClientModel *_clientModel)
 {
+    LogPrint(BCLog::QT, "GUI::setClientModel\n");
+
     this->clientModel = _clientModel;
     if(_clientModel)
     {
@@ -659,8 +608,6 @@ void GUI::setClientModel(ClientModel *_clientModel)
             walletFrame->setClientModel(_clientModel);
         }
 #endif // ENABLE_WALLET
-        unitDisplayControl->setOptionsModel(_clientModel->getOptionsModel());
-
         OptionsModel* optionsModel = _clientModel->getOptionsModel();
         if(optionsModel)
         {
@@ -670,7 +617,7 @@ void GUI::setClientModel(ClientModel *_clientModel)
             // initialize the disable state of the tray icon with the current value in the model.
             setTrayIconVisible(optionsModel->getHideTrayIcon());
 
-            m_pGuldenImpl->setOptionsModel(optionsModel);
+            setOptionsModel(optionsModel);
         }
     } else {
         // Disable possibility to show main window via action
@@ -688,35 +635,14 @@ void GUI::setClientModel(ClientModel *_clientModel)
             walletFrame->setClientModel(nullptr);
         }
 #endif // ENABLE_WALLET
-        unitDisplayControl->setOptionsModel(nullptr);
     }
-}
-
-void GUI::updateWitnessDialog()
-{
-    #ifdef ENABLE_WALLET
-    static uint64_t nUpdateTimerStart = 0;
-    if (IsArgSet("-testnet"))
-    {
-        if (nUpdateTimerStart == 0 || (GetTimeMillis() - nUpdateTimerStart > 20000))
-        {
-            nUpdateTimerStart = GetTimeMillis();
-        }
-        else
-        {
-            return;
-        }
-    }
-    if (walletFrame && walletFrame->currentWalletView() && walletFrame->currentWalletView()->witnessDialogPage)
-    {
-        walletFrame->currentWalletView()->witnessDialogPage->update();
-    }
-    #endif
 }
 
 #ifdef ENABLE_WALLET
 bool GUI::addWallet(const QString& name, WalletModel *walletModel)
 {
+    LogPrint(BCLog::QT, "GUI::addWallet\n");
+
     if(!walletFrame)
         return false;
     setWalletActionsEnabled(true);
@@ -728,23 +654,43 @@ bool GUI::addWallet(const QString& name, WalletModel *walletModel)
     // Force this to run once to ensure correct PoW2 phase displays
     clientModel->updatePoW2Display();
     rpcConsole->updatePoW2PhaseState();
-    // Force this to run once to pre-prime the 'validaty' state of witness accounts.
-    UpdateWitnessAccountStates(walletModel);
 
     return walletFrame->addWallet(name, walletModel);
 }
 
 bool GUI::setCurrentWallet(const QString& name)
 {
+    LogPrint(BCLog::QT, "GUI::setCurrentWallet\n");
+
     if(!walletFrame)
         return false;
     bool ret =  walletFrame->setCurrentWallet(name);
-    m_pGuldenImpl->setCurrentWallet(name);
+
+    // Now that we have an active wallet it is safe to show the toolbars and menubars again.
+    showToolBars();
+    appMenuBar->setVisible(true);
+
+    refreshAccountControls();
+
+    connect( walletFrame->currentWalletView()->walletModel, SIGNAL( balanceChanged(CAmount, CAmount, CAmount, CAmount, CAmount, CAmount) ), accountSummaryWidget , SLOT( balanceChanged() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
+    connect( walletFrame->currentWalletView()->walletModel, SIGNAL( balanceChanged(CAmount, CAmount, CAmount, CAmount, CAmount, CAmount) ), this , SLOT( balanceChanged() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
+    connect( walletFrame->currentWalletView()->walletModel, SIGNAL( accountNameChanged(CAccount*) ), this , SLOT( accountNameChanged(CAccount*) ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
+    connect( walletFrame->currentWalletView()->walletModel, SIGNAL( accountWarningChanged(CAccount*) ), this , SLOT( accountWarningChanged(CAccount*) ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
+    connect( walletFrame->currentWalletView()->walletModel, SIGNAL( activeAccountChanged(CAccount*) ), this , SLOT( activeAccountChanged(CAccount*) ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
+    connect( walletFrame->currentWalletView()->walletModel, SIGNAL( accountDeleted(CAccount*) ), this , SLOT( accountDeleted(CAccount*) ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
+    connect( walletFrame->currentWalletView()->walletModel, SIGNAL( accountAdded(CAccount*) ), this , SLOT( accountAdded(CAccount*) ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
+    connect( walletFrame->currentWalletView()->witnessDialogPage, SIGNAL(requestEmptyWitness()), this, SLOT(requestEmptyWitness()), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
+    connect( walletFrame->currentWalletView()->witnessDialogPage, SIGNAL(requestFundWitness(CAccount*)), this, SLOT(requestFundWitness(CAccount*)), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
+    connect( walletFrame->currentWalletView()->witnessDialogPage, SIGNAL(requestRenewWitness(CAccount*)), this, SLOT(requestRenewWitness(CAccount*)) );
+    connect( walletFrame->currentWalletView()->sendCoinsPage, SIGNAL(notifyPaymentAccepted()), this, SLOT(handlePaymentAccepted()) );
+
     return ret;
 }
 
 void GUI::removeAllWallets()
 {
+    LogPrint(BCLog::QT, "GUI::removeAllWallets\n");
+
     if(!walletFrame)
         return;
     setWalletActionsEnabled(false);
@@ -754,6 +700,8 @@ void GUI::removeAllWallets()
 
 void GUI::setWalletActionsEnabled(bool enabled)
 {
+    LogPrint(BCLog::QT, "GUI::setWalletActionsEnabled\n");
+
     witnessDialogAction->setEnabled(enabled);
     overviewAction->setEnabled(enabled);
     sendCoinsAction->setEnabled(enabled);
@@ -771,6 +719,8 @@ void GUI::setWalletActionsEnabled(bool enabled)
 
 void GUI::createTrayIcon(const NetworkStyle *networkStyle)
 {
+    LogPrint(BCLog::QT, "GUI::createTrayIcon\n");
+
 #ifndef Q_OS_MAC
     trayIcon = new QSystemTrayIcon(this);
     QString toolTip = tr("%1 client").arg(tr(PACKAGE_NAME)) + " " + networkStyle->getTitleAddText();
@@ -784,12 +734,15 @@ void GUI::createTrayIcon(const NetworkStyle *networkStyle)
 
 void GUI::createTrayIconMenu()
 {
+    LogPrint(BCLog::QT, "GUI::createTrayIconMenu\n");
+
 #ifndef Q_OS_MAC
     // return if trayIcon is unset (only on non-Mac OSes)
     if (!trayIcon)
         return;
 
     trayIconMenu = new QMenu(this);
+    trayIconMenu->setObjectName("menu_tray_icon");
     trayIcon->setContextMenu(trayIconMenu);
 
     connect(trayIcon, SIGNAL(activated(QSystemTrayIcon::ActivationReason)),
@@ -819,6 +772,8 @@ void GUI::createTrayIconMenu()
 #ifndef Q_OS_MAC
 void GUI::trayIconActivated(QSystemTrayIcon::ActivationReason reason)
 {
+    LogPrint(BCLog::QT, "GUI::trayIconActivated\n");
+
     if(reason == QSystemTrayIcon::Trigger)
     {
         // Click on system tray icon triggers show/hide of the main window
@@ -829,6 +784,8 @@ void GUI::trayIconActivated(QSystemTrayIcon::ActivationReason reason)
 
 void GUI::optionsClicked()
 {
+    LogPrint(BCLog::QT, "GUI::optionsClicked\n");
+
     if(!clientModel || !clientModel->getOptionsModel())
         return;
 
@@ -839,6 +796,8 @@ void GUI::optionsClicked()
 
 void GUI::aboutClicked()
 {
+    LogPrint(BCLog::QT, "GUI::aboutClicked\n");
+
     if(!clientModel)
         return;
 
@@ -848,6 +807,8 @@ void GUI::aboutClicked()
 
 void GUI::showDebugWindow()
 {
+    LogPrint(BCLog::QT, "GUI::showDebugWindow\n");
+
     rpcConsole->showNormal();
     rpcConsole->show();
     rpcConsole->raise();
@@ -856,18 +817,24 @@ void GUI::showDebugWindow()
 
 void GUI::showDebugWindowActivateConsole()
 {
+    LogPrint(BCLog::QT, "GUI::showDebugWindowActivateConsole\n");
+
     rpcConsole->setTabFocus(RPCConsole::TAB_CONSOLE);
     showDebugWindow();
 }
 
 void GUI::showHelpMessageClicked()
 {
+    LogPrint(BCLog::QT, "GUI::showHelpMessageClicked\n");
+
     helpMessageDialog->show();
 }
 
 #ifdef ENABLE_WALLET
 void GUI::openClicked()
 {
+    LogPrint(BCLog::QT, "GUI::openClicked\n");
+
     OpenURIDialog dlg(this);
     if(dlg.exec())
     {
@@ -877,19 +844,28 @@ void GUI::openClicked()
 
 void GUI::showWitnessDialog()
 {
+    LogPrint(BCLog::QT, "GUI::showWitnessDialog\n");
+
     witnessDialogAction->setChecked(true);
-    walletFrame->currentWalletView()->witnessDialogPage->update();
-    walletFrame->currentWalletView()->setCurrentWidget(walletFrame->currentWalletView()->witnessDialogPage);
+    if (walletFrame)
+    {
+        walletFrame->currentWalletView()->witnessDialogPage->update();
+        walletFrame->currentWalletView()->setCurrentWidget(walletFrame->currentWalletView()->witnessDialogPage);
+    }
 }
 
 void GUI::gotoOverviewPage()
 {
+    LogPrint(BCLog::QT, "GUI::gotoOverviewPage\n");
+
     overviewAction->setChecked(true);
     if (walletFrame) walletFrame->gotoOverviewPage();
 }
 
 void GUI::gotoHistoryPage()
 {
+    LogPrint(BCLog::QT, "GUI::gotoHistoryPage\n");
+
     historyAction->setChecked(true);
     if (walletFrame) walletFrame->gotoHistoryPage();
     //if (walletFrame) walletFrame->currentWalletView()->historyPage->update();
@@ -897,6 +873,8 @@ void GUI::gotoHistoryPage()
 
 void GUI::gotoReceiveCoinsPage()
 {
+    LogPrint(BCLog::QT, "GUI::gotoReceiveCoinsPage\n");
+
     receiveCoinsAction->setChecked(true);
     if (walletFrame) walletFrame->gotoReceiveCoinsPage();
     //if (walletFrame) walletFrame->currentWalletView()->receiveCoinsPage->update();
@@ -904,6 +882,8 @@ void GUI::gotoReceiveCoinsPage()
 
 void GUI::gotoSendCoinsPage(QString addr)
 {
+    LogPrint(BCLog::QT, "GUI::gotoSendCoinsPage\n");
+
     sendCoinsAction->setChecked(true);
     if (walletFrame) walletFrame->gotoSendCoinsPage(addr);
     if (walletFrame) walletFrame->currentWalletView()->sendCoinsPage->update();
@@ -912,6 +892,8 @@ void GUI::gotoSendCoinsPage(QString addr)
 
 void GUI::updateNetworkState()
 {
+    LogPrint(BCLog::QT, "GUI::updateNetworkState\n");
+
     int count = clientModel->getNumConnections();
     float devicePixelRatio = 1.0;
     #if QT_VERSION > 0x050100
@@ -946,22 +928,30 @@ void GUI::updateNetworkState()
 
 void GUI::setNumConnections(int count)
 {
+    LogPrint(BCLog::QT, "GUI::setNumConnections\n");
+
     updateNetworkState();
 }
 
 void GUI::setNetworkActive(bool networkActive)
 {
+    LogPrint(BCLog::QT, "GUI::setNetworkActive\n");
+
     updateNetworkState();
 }
 
 void GUI::updateHeadersSyncProgressLabel(int current, int total)
 {
+    LogPrint(BCLog::QT, "GUI::updateHeadersSyncProgressLabel\n");
+
     if (total - current > HEADER_HEIGHT_DELTA_SYNC)
         progressBarLabel->setText(tr("Syncing Headers (%1%)...").arg(QString::number(100.0 * current / total, 'f', 1)));
 }
 
 void GUI::setNumBlocks(int count, const QDateTime& blockDate, double nVerificationProgress, bool header)
 {
+    LogPrint(BCLog::QT, "GUI::setNumBlocks\n");
+
     if (!clientModel)
         return;
 
@@ -1013,11 +1003,11 @@ void GUI::setNumBlocks(int count, const QDateTime& blockDate, double nVerificati
 
     if (IsInitialBlockDownload())
     {
-        m_pGuldenImpl->hideBalances();
+        hideBalances();
     }
     else
     {
-        m_pGuldenImpl->showBalances();
+        showBalances();
     }
 
     // Set icon state: spinning if catching up, tick otherwise
@@ -1034,7 +1024,7 @@ void GUI::setNumBlocks(int count, const QDateTime& blockDate, double nVerificati
         }
 #endif // ENABLE_WALLET
 
-        m_pGuldenImpl->hideProgressBarLabel();
+        hideProgressBarLabel();
         progressBarLabel->setVisible(false);
         progressBar->setVisible(false);
     }
@@ -1042,7 +1032,7 @@ void GUI::setNumBlocks(int count, const QDateTime& blockDate, double nVerificati
     {
         QString timeBehindText = GUIUtil::formatNiceTimeOffset(secs);
 
-        m_pGuldenImpl->showProgressBarLabel();
+        showProgressBarLabel();
         progressBarLabel->setVisible(true);
         progressBar->setFormat(tr("%1 behind").arg(timeBehindText));
         progressBar->setMaximum(1000000000);
@@ -1086,6 +1076,8 @@ void GUI::setNumBlocks(int count, const QDateTime& blockDate, double nVerificati
 
 void GUI::setNumHeaders(int current, int total)
 {
+    LogPrint(BCLog::QT, "GUI::setNumHeaders\n");
+
     if (!clientModel)
         return;
 
@@ -1100,6 +1092,8 @@ void GUI::setNumHeaders(int current, int total)
 
 void GUI::message(const QString &title, const QString &message, unsigned int style, bool *ret)
 {
+    LogPrint(BCLog::QT, "GUI::message\n");
+
     QString strTitle = title; // default title
     // Default to information icon
     int nMBoxIcon = QMessageBox::Information;
@@ -1154,19 +1148,16 @@ void GUI::message(const QString &title, const QString &message, unsigned int sty
         notificator->notify((Notificator::Class)nNotifyIcon, strTitle, message);
 }
 
-#include <units.h>
-void GUI::setBalance(const CAmount& balance, const CAmount& unconfirmedBalance, const CAmount& immatureBalance, const CAmount& watchOnlyBalance, const CAmount& watchUnconfBalance, const CAmount& watchImmatureBalance)
-{
-    m_pGuldenImpl->setBalance(balance, unconfirmedBalance, immatureBalance, watchOnlyBalance, watchUnconfBalance, watchImmatureBalance);
-}
-
 void GUI::resizeEvent(QResizeEvent* event)
 {
+    LogPrint(BCLog::QT, "GUI::resizeEvent\n");
+
     QMainWindow::resizeEvent(event);
 
     // If we are working with limited horizontal spacing then hide some non-essential UI elements to help things fit more comfortably.
     bool restrictedHorizontalSpace = (event->size().width() < 940) ? true : false;
-    accountSummaryWidget->showForexBalance(!restrictedHorizontalSpace);
+    if (accountSummaryWidget)
+        accountSummaryWidget->showForexBalance(!restrictedHorizontalSpace);
     if (walletFrame && walletFrame->currentWalletView() && walletFrame->currentWalletView()->receiveCoinsPage)
         walletFrame->currentWalletView()->receiveCoinsPage->setShowCopyQRAsImageButton(!restrictedHorizontalSpace);
     else
@@ -1175,6 +1166,8 @@ void GUI::resizeEvent(QResizeEvent* event)
 
 void GUI::changeEvent(QEvent *e)
 {
+    LogPrint(BCLog::QT, "GUI::changeEvent\n");
+
     QMainWindow::changeEvent(e);
 #ifndef Q_OS_MAC // Ignored on Mac
     if(e->type() == QEvent::WindowStateChange)
@@ -1194,33 +1187,43 @@ void GUI::changeEvent(QEvent *e)
 
 void GUI::closeEvent(QCloseEvent *event)
 {
-#ifndef Q_OS_MAC // Ignored on Mac
+    LogPrint(BCLog::QT, "GUI::closeEvent\n");
+
+    if (exitApp)
+    {
+        QMainWindow::closeEvent(event);
+        return;
+    }
+
+#ifdef Q_OS_MAC // Ignored on Mac
+    QMainWindow::closeEvent(event);
+    return;
+#else
+    //NB! This is a bit subtle, but we want to ignore this close event even when we are closing.
+    //The core needs to clean up various things before the UI can safely close, so we signal to the core that we are closing and then let the core signal to us when we should actually do so.
+    //In the meantime we hide the window for immediate user feedback.
+    QMainWindow::hide();
+    event->ignore();
     if(clientModel && clientModel->getOptionsModel())
     {
         if(!clientModel->getOptionsModel()->getMinimizeOnClose())
         {
             // close rpcConsole in case it was open to make some space for the shutdown window
             rpcConsole->close();
-
-            QApplication::quit();
+            GuldenAppManager::gApp->shutdown();
         }
         else
-        {
             QMainWindow::showMinimized();
-            event->ignore();
-        }
     }
-    else if(m_pGuldenImpl && m_pGuldenImpl->welcomeScreenIsVisible())
-    {
-        QApplication::quit();
-    }
-#else
-    QMainWindow::closeEvent(event);
+    else if(welcomeScreenIsVisible())
+        GuldenAppManager::gApp->shutdown();
 #endif
 }
 
 void GUI::showEvent(QShowEvent *event)
 {
+    LogPrint(BCLog::QT, "GUI::showEvent\n");
+
     // enable the debug window when the main window shows up
     openRPCConsoleAction->setEnabled(true);
     aboutAction->setEnabled(true);
@@ -1230,6 +1233,8 @@ void GUI::showEvent(QShowEvent *event)
 #ifdef ENABLE_WALLET
 void GUI::incomingTransaction(const QString& date, int unit, const CAmount& amountReceived, const CAmount& amountSent, const QString& type, const QString& address, const QString& account, const QString& label)
 {
+    LogPrint(BCLog::QT, "GUI::incomingTransaction\n");
+
     // On new transaction, make an info balloon
     QString msg = tr("Date: %1\n").arg(date) +
                   tr("Received: %1\n").arg(GuldenUnits::formatWithUnit(unit, amountReceived, true)) +
@@ -1263,6 +1268,8 @@ void GUI::incomingTransaction(const QString& date, int unit, const CAmount& amou
 
 void GUI::dragEnterEvent(QDragEnterEvent *event)
 {
+    LogPrint(BCLog::QT, "GUI::dragEnterEvent\n");
+
     // Accept only URIs
     if(event->mimeData()->hasUrls())
         event->acceptProposedAction();
@@ -1270,6 +1277,8 @@ void GUI::dragEnterEvent(QDragEnterEvent *event)
 
 void GUI::dropEvent(QDropEvent *event)
 {
+    LogPrint(BCLog::QT, "GUI::dropEvent\n");
+
     if(event->mimeData()->hasUrls())
     {
         for(const QUrl &uri : event->mimeData()->urls())
@@ -1295,6 +1304,8 @@ bool GUI::eventFilter(QObject *object, QEvent *event)
 #ifdef ENABLE_WALLET
 bool GUI::handlePaymentRequest(const SendCoinsRecipient& recipient)
 {
+    LogPrint(BCLog::QT, "GUI::handlePaymentRequest\n");
+
     // URI has to be valid
     if (walletFrame && walletFrame->handlePaymentRequest(recipient))
     {
@@ -1307,6 +1318,8 @@ bool GUI::handlePaymentRequest(const SendCoinsRecipient& recipient)
 
 void GUI::setEncryptionStatus(int status)
 {
+    LogPrint(BCLog::QT, "GUI::setEncryptionStatus\n");
+
     float devicePixelRatio = 1.0;
     #if QT_VERSION > 0x050100
     devicePixelRatio = ((QGuiApplication*)QCoreApplication::instance())->devicePixelRatio();
@@ -1342,6 +1355,8 @@ void GUI::setEncryptionStatus(int status)
 
 void GUI::showNormalIfMinimized(bool fToggleHidden)
 {
+    LogPrint(BCLog::QT, "GUI::showNormalIfMinimized\n");
+
     if(!clientModel)
         return;
 
@@ -1367,28 +1382,22 @@ void GUI::showNormalIfMinimized(bool fToggleHidden)
 
 void GUI::toggleHidden()
 {
-    showNormalIfMinimized(true);
-}
+    LogPrint(BCLog::QT, "GUI::toggleHidden\n");
 
-void GUI::detectShutdown()
-{
-    if (ShutdownRequested())
-    {
-        if(rpcConsole)
-            rpcConsole->hide();
-        qApp->quit();
-    }
+    showNormalIfMinimized(true);
 }
 
 void GUI::showProgress(const QString &title, int nProgress)
 {
+    LogPrint(BCLog::QT, "GUI::showProgress\n");
+
     if (nProgress == 100)
     {
         if (progressBarLabel->text() == title)
         {
             progressBarLabel->setVisible(false);
             progressBar->setVisible(false);
-            m_pGuldenImpl->hideProgressBarLabel();
+            hideProgressBarLabel();
         }
     }
     else
@@ -1400,7 +1409,7 @@ void GUI::showProgress(const QString &title, int nProgress)
             progressBar->setValue(nProgress * 10000000.0 + 0.5);
             progressBarLabel->setVisible(true);
             progressBar->setVisible(true);
-            m_pGuldenImpl->showProgressBarLabel();
+            showProgressBarLabel();
 
             QString tooltip = title + "<br>" + QString("%1% complete.").arg(nProgress);
             progressBarLabel->setToolTip(tooltip);
@@ -1411,6 +1420,8 @@ void GUI::showProgress(const QString &title, int nProgress)
 
 void GUI::setTrayIconVisible(bool fHideTrayIcon)
 {
+    LogPrint(BCLog::QT, "GUI::setTrayIconVisible\n");
+
     if (trayIcon)
     {
         trayIcon->setVisible(!fHideTrayIcon);
@@ -1419,6 +1430,8 @@ void GUI::setTrayIconVisible(bool fHideTrayIcon)
 
 void GUI::showModalOverlay()
 {
+    LogPrint(BCLog::QT, "GUI::showModalOverlay\n");
+
     if (modalOverlay && (progressBar->isVisible() || modalOverlay->isLayerVisible()))
         modalOverlay->toggleVisibility();
 }
@@ -1442,101 +1455,27 @@ static bool ThreadSafeMessageBox(GUI *gui, const std::string& message, const std
 
 void GUI::subscribeToCoreSignals()
 {
+    LogPrint(BCLog::QT, "GUI::subscribeToCoreSignals\n");
+
     // Connect signals to client
     uiInterface.ThreadSafeMessageBox.connect(boost::bind(ThreadSafeMessageBox, this, _1, _2, _3));
     uiInterface.ThreadSafeQuestion.connect(boost::bind(ThreadSafeMessageBox, this, _1, _3, _4));
-    #ifdef ENABLE_WALLET
-    uiInterface.NotifyBlockTip.connect(boost::bind(BlockTipChangedHandler, this, _1, _2));
-    #endif
 }
 
 void GUI::unsubscribeFromCoreSignals()
 {
+    LogPrint(BCLog::QT, "GUI::unsubscribeFromCoreSignals\n");
+
     // Disconnect signals from client
     uiInterface.ThreadSafeMessageBox.disconnect(boost::bind(ThreadSafeMessageBox, this, _1, _2, _3));
     uiInterface.ThreadSafeQuestion.disconnect(boost::bind(ThreadSafeMessageBox, this, _1, _3, _4));
-    #ifdef ENABLE_WALLET
-    uiInterface.NotifyBlockTip.disconnect(boost::bind(BlockTipChangedHandler, this, _1, _2));
-    #endif
 }
 
 void GUI::toggleNetworkActive()
 {
+    LogPrint(BCLog::QT, "GUI::toggleNetworkActive\n");
+
     if (clientModel) {
         clientModel->setNetworkActive(!clientModel->getNetworkActive());
-    }
-}
-
-UnitDisplayStatusBarControl::UnitDisplayStatusBarControl(const PlatformStyle *platformStyle) :
-    optionsModel(0),
-    menu(0)
-{
-    createContextMenu();
-    setToolTip(tr("Unit to show amounts in. Click to select another unit."));
-    QList<GuldenUnits::Unit> units = GuldenUnits::availableUnits();
-    int max_width = 0;
-    const QFontMetrics fm(font());
-    for (const GuldenUnits::Unit unit : units)
-    {
-        max_width = qMax(max_width, fm.width(GuldenUnits::name(unit)));
-    }
-    setMinimumSize(max_width, 0);
-    setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    setStyleSheet(QString("QLabel { color : %1 }").arg(platformStyle->SingleColor().name()));
-}
-
-/** So that it responds to button clicks */
-void UnitDisplayStatusBarControl::mousePressEvent(QMouseEvent *event)
-{
-    onDisplayUnitsClicked(event->pos());
-}
-
-/** Creates context menu, its actions, and wires up all the relevant signals for mouse events. */
-void UnitDisplayStatusBarControl::createContextMenu()
-{
-    menu = new QMenu(this);
-    for(GuldenUnits::Unit u : GuldenUnits::availableUnits())
-    {
-        QAction *menuAction = new QAction(QString(GuldenUnits::name(u)), this);
-        menuAction->setData(QVariant(u));
-        menu->addAction(menuAction);
-    }
-    connect(menu,SIGNAL(triggered(QAction*)),this,SLOT(onMenuSelection(QAction*)));
-}
-
-/** Lets the control know about the Options Model (and its signals) */
-void UnitDisplayStatusBarControl::setOptionsModel(OptionsModel *_optionsModel)
-{
-    if (_optionsModel)
-    {
-        this->optionsModel = _optionsModel;
-
-        // be aware of a display unit change reported by the OptionsModel object.
-        connect(_optionsModel,SIGNAL(displayUnitChanged(int)),this,SLOT(updateDisplayUnit(int)));
-
-        // initialize the display units label with the current value in the model.
-        updateDisplayUnit(_optionsModel->getDisplayUnit());
-    }
-}
-
-/** When Display Units are changed on OptionsModel it will refresh the display text of the control on the status bar */
-void UnitDisplayStatusBarControl::updateDisplayUnit(int newUnits)
-{
-    setText(GuldenUnits::name(newUnits));
-}
-
-/** Shows context menu with Display Unit options by the mouse coordinates */
-void UnitDisplayStatusBarControl::onDisplayUnitsClicked(const QPoint& point)
-{
-    QPoint globalPos = mapToGlobal(point);
-    menu->exec(globalPos);
-}
-
-/** Tells underlying optionsModel to update its current display unit. */
-void UnitDisplayStatusBarControl::onMenuSelection(QAction* action)
-{
-    if (action)
-    {
-        optionsModel->setDisplayUnit(action->data());
     }
 }

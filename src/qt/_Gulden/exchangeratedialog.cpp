@@ -11,7 +11,7 @@
 #include <QModelIndex>
 
 
-ExchangeRateDialog::ExchangeRateDialog(const PlatformStyle *platformStyle, QWidget *parent, QAbstractTableModel* tableModel)
+ExchangeRateDialog::ExchangeRateDialog(const QStyle *platformStyle, QWidget *parent, QAbstractTableModel* tableModel)
 : QDialog( parent, Qt::Dialog )
 , ui( new Ui::ExchangeRateDialog )
 , platformStyle( platformStyle )
@@ -28,15 +28,10 @@ ExchangeRateDialog::ExchangeRateDialog(const PlatformStyle *platformStyle, QWidg
     ui->ExchangeRateTable->setSelectionBehavior(QAbstractItemView::SelectRows);
     ui->ExchangeRateTable->verticalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
 
-    RichTextDelegate* delegate = new RichTextDelegate();
+    RichTextDelegate* delegate = new RichTextDelegate(this);
     ui->ExchangeRateTable->setItemDelegate(delegate);
 
     setWindowFlags(windowFlags() ^ Qt::WindowContextHelpButtonHint);
-}
-
-ExchangeRateDialog::~ExchangeRateDialog()
-{
-    delete ui;
 }
 
 void ExchangeRateDialog::setOptionsModel(OptionsModel* model)
@@ -57,7 +52,17 @@ void ExchangeRateDialog::setOptionsModel(OptionsModel* model)
     }
 
 
-    connect(ui->ExchangeRateTable->selectionModel(), SIGNAL(selectionChanged(const QItemSelection &, const QItemSelection &)),  SLOT(selectionChanged(const QItemSelection &, const QItemSelection &)), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection));
+    connect(ui->ExchangeRateTable->selectionModel(), SIGNAL(selectionChanged(const QItemSelection &, const QItemSelection &)), this, SLOT(selectionChanged(const QItemSelection &, const QItemSelection &)), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection));
+}
+
+void ExchangeRateDialog::disconnectSlots()
+{
+    disconnect(ui->ExchangeRateTable->selectionModel(), SIGNAL(selectionChanged(const QItemSelection &, const QItemSelection &)), this, SLOT(selectionChanged(const QItemSelection &, const QItemSelection &)));
+}
+
+ExchangeRateDialog::~ExchangeRateDialog()
+{
+    delete ui;
 }
 
 void ExchangeRateDialog::selectionChanged(const QItemSelection& selected, const QItemSelection& deselected)

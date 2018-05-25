@@ -11,6 +11,7 @@
 // file COPYING
 
 #include "validation.h"
+#include "witnessvalidation.h"
 
 #include "alert.h"
 #include "arith_uint256.h"
@@ -26,6 +27,7 @@
 #include "consensus/validation.h"
 #include "fs.h"
 #include "hash.h"
+#include "unity/appmanager.h"
 #include "init.h"
 #include "policy/fees.h"
 #include "policy/policy.h"
@@ -109,53 +111,12 @@ int64_t nMinimumInputValue = DUST_HARD_LIMIT;
 
 const std::string strMessageMagic = "Guldencoin Signed Message:\n";
 
-
+std::set<CBlockIndex*, CBlockIndexWorkComparator> setBlockIndexCandidates;
 
 // Internal stuff
 namespace {
-
-    struct CBlockIndexWorkComparator
-    {
-        bool operator()(CBlockIndex *pa, CBlockIndex *pb) const {
-            // First sort by most total work, ...
-            if (pa->nChainWork > pb->nChainWork) return false;
-            if (pa->nChainWork < pb->nChainWork) return true;
-
-            // (Phase 3) PoW blocks at same height as witness blocks - always make the PoW blocks rank higher.
-            if (pa->nHeight == pb->nHeight)
-            {
-                if (pa->nVersionPoW2Witness == 0 && pb->nVersionPoW2Witness != 0)
-                {
-                    return false;
-                }
-                if (pa->nVersionPoW2Witness != 0 && pb->nVersionPoW2Witness == 0)
-                {
-                    return true;
-                }
-            }
-
-            // ... then by earliest time received, ...
-            if (pa->nSequenceId < pb->nSequenceId) return false;
-            if (pa->nSequenceId > pb->nSequenceId) return true;
-
-            // Use pointer address as tie breaker (should only happen with blocks
-            // loaded from disk, as those all have id 0).
-            if (pa < pb) return false;
-            if (pa > pb) return true;
-
-            // Identical blocks.
-            return false;
-        }
-    };
-
     CBlockIndex *pindexBestInvalid;
 
-    /**
-     * The set of all CBlockIndex entries with BLOCK_VALID_TRANSACTIONS (for itself and all ancestors) and
-     * as good as our current tip or better. Entries may be failed, though, and pruning nodes may be
-     * missing the data for the block.
-     */
-    std::set<CBlockIndex*, CBlockIndexWorkComparator> setBlockIndexCandidates;
     /** All pairs A->B, where A (or one of its ancestors) misses transactions, but B has transactions.
      * Pruned nodes may have entries where B is missing data.
      */
@@ -210,22 +171,6 @@ CBlockIndex* FindForkInGlobalIndex(const CChain& chain, const CBlockLocator& loc
 CCoinsViewDB *pcoinsdbview = NULL;
 CCoinsViewCache *pcoinsTip = NULL;
 CBlockTreeDB *pblocktree = NULL;
-
-CWitViewDB *ppow2witdbview = NULL;
-std::shared_ptr<CCoinsViewCache> ppow2witTip = NULL;
-
-enum FlushStateMode {
-    FLUSH_STATE_NONE,
-    FLUSH_STATE_IF_NEEDED,
-    FLUSH_STATE_PERIODIC,
-    FLUSH_STATE_ALWAYS
-};
-
-// See definition for documentation
-static bool FlushStateToDisk(const CChainParams& chainParams, CValidationState &state, FlushStateMode mode, int nManualPruneHeight=0);
-static void FindFilesToPruneManual(std::set<int>& setFilesToPrune, int nManualPruneHeight);
-static void FindFilesToPrune(std::set<int>& setFilesToPrune, uint64_t nPruneAfterHeight);
-static bool CheckInputs(const CTransaction& tx, CValidationState &state, const CCoinsViewCache &inputs, bool fScriptChecks, unsigned int flags, bool cacheStore, PrecomputedTransactionData& txdata, std::vector<CWitnessTxBundle>* pWitnessBundles, std::vector<CScriptCheck> *pvChecks = NULL);
 
 bool CheckFinalTx(const CTransaction &tx, int flags)
 {
@@ -347,594 +292,6 @@ bool CheckSequenceLocks(const CTransaction &tx, int flags, LockPoints* lp, bool 
     return EvaluateSequenceLocks(index, lockPair);
 }
 
-static void LimitMempoolSize(CTxMemPool& pool, size_t limit, unsigned long age) {
-    int expired = pool.Expire(GetTime() - age);
-    if (expired != 0) {
-        LogPrint(BCLog::MEMPOOL, "Expired %i transactions from the memory pool\n", expired);
-    }
-
-    std::vector<COutPoint> vNoSpendsRemaining;
-    pool.TrimToSize(limit, &vNoSpendsRemaining);
-    for(const COutPoint& removed : vNoSpendsRemaining)
-        pcoinsTip->Uncache(removed);
-}
-
-/** Convert CValidationState to a human-readable message for logging */
-std::string FormatStateMessage(const CValidationState &state)
-{
-    return strprintf("%s%s (code %i)",
-        state.GetRejectReason(),
-        state.GetDebugMessage().empty() ? "" : ", "+state.GetDebugMessage(),
-        state.GetRejectCode());
-}
-
-static bool IsCurrentForFeeEstimation()
-{
-    AssertLockHeld(cs_main);
-    if (IsInitialBlockDownload())
-        return false;
-    if (chainActive.Tip()->GetBlockTime() < (GetTime() - MAX_FEE_ESTIMATION_TIP_AGE))
-        return false;
-    if (chainActive.Height() < pindexBestHeader->nHeight - 1)
-        return false;
-    return true;
-}
-
-/* Make mempool consistent after a reorg, by re-adding or recursively erasing
- * disconnected block transactions from the mempool, and also removing any
- * other transactions from the mempool that are no longer valid given the new
- * tip/height.
- *
- * Note: we assume that disconnectpool only contains transactions that are NOT
- * confirmed in the current chain nor already in the mempool (otherwise,
- * in-mempool descendants of such transactions would be removed).
- *
- * Passing fAddToMempool=false will skip trying to add the transactions back,
- * and instead just erase from the mempool as needed.
- */
-
-void UpdateMempoolForReorg(DisconnectedBlockTransactions &disconnectpool, bool fAddToMempool)
-{
-    AssertLockHeld(cs_main);
-    std::vector<uint256> vHashUpdate;
-    // disconnectpool's insertion_order index sorts the entries from
-    // oldest to newest, but the oldest entry will be the last tx from the
-    // latest mined block that was disconnected.
-    // Iterate disconnectpool in reverse, so that we add transactions
-    // back to the mempool starting with the earliest transaction that had
-    // been previously seen in a block.
-    auto it = disconnectpool.queuedTx.get<insertion_order>().rbegin();
-    while (it != disconnectpool.queuedTx.get<insertion_order>().rend()) {
-        // ignore validation errors in resurrected transactions
-        CValidationState stateDummy;
-        if (!fAddToMempool || (*it)->IsCoinBase() || !AcceptToMemoryPool(mempool, stateDummy, *it, false, NULL, NULL, true)) {
-            // If the transaction doesn't make it in to the mempool, remove any
-            // transactions that depend on it (which would now be orphans).
-            mempool.removeRecursive(**it, MemPoolRemovalReason::REORG);
-        } else if (mempool.exists((*it)->GetHash())) {
-            vHashUpdate.push_back((*it)->GetHash());
-        }
-        ++it;
-    }
-    disconnectpool.queuedTx.clear();
-    // AcceptToMemoryPool/addUnchecked all assume that new mempool entries have
-    // no in-mempool children, which is generally not true when adding
-    // previously-confirmed transactions back to the mempool.
-    // UpdateTransactionsFromBlock finds descendants of any transactions in
-    // the disconnectpool that were added back and cleans up the mempool state.
-    mempool.UpdateTransactionsFromBlock(vHashUpdate);
-
-    // We also need to remove any now-immature transactions
-    mempool.removeForReorg(pcoinsTip, chainActive.Tip()->nHeight + 1, STANDARD_LOCKTIME_VERIFY_FLAGS);
-    // Re-limit mempool size, in case we added any transactions
-    LimitMempoolSize(mempool, GetArg("-maxmempool", DEFAULT_MAX_MEMPOOL_SIZE) * 1000000, GetArg("-mempoolexpiry", DEFAULT_MEMPOOL_EXPIRY) * 60 * 60);
-}
-
-static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool& pool, CValidationState& state, const CTransactionRef& ptx, bool fLimitFree,
-                              bool* pfMissingInputs, int64_t nAcceptTime, std::list<CTransactionRef>* plTxnReplaced,
-                              bool fOverrideMempoolLimit, const CAmount& nAbsurdFee, std::vector<COutPoint>& coins_to_uncache)
-{
-    const CTransaction& tx = *ptx;
-    const uint256 hash = tx.GetHash();
-    AssertLockHeld(cs_main);
-    if (pfMissingInputs)
-        *pfMissingInputs = false;
-
-    if (!CheckTransaction(tx, state))
-        return false; // state filled in by CheckTransaction
-
-    std::vector<CWitnessTxBundle> witnessBundles;
-    if (!CheckTransactionContextual(tx, state, chainActive.Tip()->nHeight, &witnessBundles))
-        return false; // state filled in by CheckTransaction
-
-    // Coinbase is only valid in a block, not as a loose transaction
-    if (tx.IsCoinBase())
-        return state.DoS(100, false, REJECT_INVALID, "coinbase");
-
-    // Reject transactions with witness before segregated witness activates (override with -prematurewitness)
-    bool witnessEnabled = IsSegSigEnabled(chainActive.Tip()->pprev, chainparams, chainActive, nullptr);
-    if (!GetBoolArg("-prematurewitness",false) && tx.HasWitness() && !witnessEnabled) {
-        return state.DoS(0, false, REJECT_NONSTANDARD, "no-witness-yet", true);
-    }
-
-    // Rather not work on nonstandard transactions (unless -testnet/-regtest)
-    std::string reason;
-    if (fRequireStandard && !IsStandardTx(tx, reason, witnessEnabled))
-        return state.DoS(0, false, REJECT_NONSTANDARD, reason);
-
-    // Only accept nLockTime-using transactions that can be mined in the next
-    // block; we don't want our mempool filled up with transactions that can't
-    // be mined yet.
-    if (!CheckFinalTx(tx, STANDARD_LOCKTIME_VERIFY_FLAGS))
-        return state.DoS(0, false, REJECT_NONSTANDARD, "non-final");
-
-    // is it already in the memory pool?
-    if (pool.exists(hash))
-        return state.Invalid(false, REJECT_ALREADY_KNOWN, "txn-already-in-mempool");
-
-    // Check for conflicts with in-memory transactions
-    std::set<uint256> setConflicts;
-    {
-    LOCK(pool.cs); // protect pool.mapNextTx
-    for(const CTxIn &txin : tx.vin)
-    {
-        auto itConflicting = pool.mapNextTx.find(txin.prevout);
-        if (itConflicting != pool.mapNextTx.end())
-        {
-            const CTransaction *ptxConflicting = itConflicting->second;
-            if (!setConflicts.count(ptxConflicting->GetHash()))
-            {
-                // Allow opt-out of transaction replacement by setting
-                // nSequence >= maxint-1 on all inputs.
-                //
-                // maxint-1 is picked to still allow use of nLockTime by
-                // non-replaceable transactions. All inputs rather than just one
-                // is for the sake of multi-party protocols, where we don't
-                // want a single party to be able to disable replacement.
-                //
-                // The opt-out ignores descendants as anyone relying on
-                // first-seen mempool behavior should be checking all
-                // unconfirmed ancestors anyway; doing otherwise is hopelessly
-                // insecure.
-                bool fReplacementOptOut = true;
-                if (fEnableReplacement)
-                {
-                    for(const CTxIn &_txin : ptxConflicting->vin)
-                    {
-                        //fixme: (2.0)
-                        if (_txin.GetSequence(ptxConflicting->nVersion) < std::numeric_limits<unsigned int>::max()-1)
-                        {
-                            fReplacementOptOut = false;
-                            break;
-                        }
-                    }
-                }
-                if (fReplacementOptOut)
-                    return state.Invalid(false, REJECT_CONFLICT, "txn-mempool-conflict");
-
-                setConflicts.insert(ptxConflicting->GetHash());
-            }
-        }
-    }
-    }
-
-    {
-        CCoinsView dummy;
-        CCoinsViewCache view(&dummy);
-
-        CAmount nValueIn = 0;
-        LockPoints lp;
-        {
-        LOCK(pool.cs);
-        CCoinsViewMemPool viewMemPool(pcoinsTip, pool);
-        view.SetBackend(viewMemPool);
-
-        // do we already have it?
-        for (size_t out = 0; out < tx.vout.size(); out++) {
-            COutPoint outpoint(hash, out);
-            bool had_coin_in_cache = pcoinsTip->HaveCoinInCache(outpoint);
-            if (view.HaveCoin(outpoint)) {
-                if (!had_coin_in_cache) {
-                    coins_to_uncache.push_back(outpoint);
-                }
-                return state.Invalid(false, REJECT_ALREADY_KNOWN, "txn-already-known");
-            }
-        }
-
-        // do all inputs exist?
-        for(const CTxIn txin : tx.vin) {
-            if (!pcoinsTip->HaveCoinInCache(txin.prevout)) {
-                coins_to_uncache.push_back(txin.prevout);
-            }
-            if (!view.HaveCoin(txin.prevout)) {
-                if (pfMissingInputs) {
-                    *pfMissingInputs = true;
-                }
-                return false; // fMissingInputs and !state.IsInvalid() is used to detect this condition, don't set state.Invalid()
-            }
-        }
-
-        // Bring the best block into scope
-        view.GetBestBlock();
-
-        nValueIn = view.GetValueIn(tx);
-
-        // we have all inputs cached now, so switch back to dummy, so we don't need to keep lock on mempool
-        view.SetBackend(dummy);
-
-        // Only accept BIP68 sequence locked transactions that can be mined in the next
-        // block; we don't want our mempool filled up with transactions that can't
-        // be mined yet.
-        // Must keep pool.cs for this unless we change CheckSequenceLocks to take a
-        // CoinsViewCache instead of create its own
-        if (!CheckSequenceLocks(tx, STANDARD_LOCKTIME_VERIFY_FLAGS, &lp))
-            return state.DoS(0, false, REJECT_NONSTANDARD, "non-BIP68-final");
-        }
-
-        // Check for non-standard pay-to-script-hash in inputs
-        if (fRequireStandard && !AreInputsStandard(tx, view))
-            return state.Invalid(false, REJECT_NONSTANDARD, "bad-txns-nonstandard-inputs");
-
-        // Check for non-standard witness in P2WSH
-        if (tx.HasWitness() && fRequireStandard && !IsWitnessStandard(tx, view))
-            return state.DoS(0, false, REJECT_NONSTANDARD, "bad-witness-nonstandard", true);
-
-        int64_t nSigOpsCost = GetTransactionSigOpCost(tx, view, STANDARD_SCRIPT_VERIFY_FLAGS);
-
-        CAmount nValueOut = tx.GetValueOut();
-        CAmount nFees = nValueIn-nValueOut;
-        // nModifiedFees includes any fee deltas from PrioritiseTransaction
-        CAmount nModifiedFees = nFees;
-        pool.ApplyDelta(hash, nModifiedFees);
-
-        // Keep track of transactions that spend a coinbase, which we re-scan
-        // during reorgs to ensure COINBASE_MATURITY is still met.
-        bool fSpendsCoinbase = false;
-        for(const CTxIn &txin : tx.vin) {
-            const Coin &coin = view.AccessCoin(txin.prevout);
-            if (coin.IsCoinBase()) {
-                fSpendsCoinbase = true;
-                break;
-            }
-        }
-
-        CTxMemPoolEntry entry(ptx, nFees, nAcceptTime, chainActive.Height(),
-                              fSpendsCoinbase, nSigOpsCost, lp);
-        unsigned int nSize = entry.GetTxSize();
-
-        // Check that the transaction doesn't have an excessive number of
-        // sigops, making it impossible to mine. Since the coinbase transaction
-        // itself can contain sigops MAX_STANDARD_TX_SIGOPS is less than
-        // MAX_BLOCK_SIGOPS; we still consider this an invalid rather than
-        // merely non-standard transaction.
-        if (nSigOpsCost > MAX_STANDARD_TX_SIGOPS_COST)
-            return state.DoS(0, false, REJECT_NONSTANDARD, "bad-txns-too-many-sigops", false,
-                strprintf("%d", nSigOpsCost));
-
-        CAmount mempoolRejectFee = pool.GetMinFee(GetArg("-maxmempool", DEFAULT_MAX_MEMPOOL_SIZE) * 1000000).GetFee(nSize);
-        if (mempoolRejectFee > 0 && nModifiedFees < mempoolRejectFee) {
-            return state.DoS(0, false, REJECT_INSUFFICIENTFEE, "mempool min fee not met", false, strprintf("%d < %d", nFees, mempoolRejectFee));
-        }
-
-        // No transactions are allowed below minRelayTxFee except from disconnected blocks
-        if (fLimitFree && nModifiedFees < ::minRelayTxFee.GetFee(nSize)) {
-            return state.DoS(0, false, REJECT_INSUFFICIENTFEE, "min relay fee not met");
-        }
-
-        if (nAbsurdFee && nFees > nAbsurdFee)
-            return state.Invalid(false,
-                REJECT_HIGHFEE, "absurdly-high-fee",
-                strprintf("%d > %d", nFees, nAbsurdFee));
-
-        // Calculate in-mempool ancestors, up to a limit.
-        CTxMemPool::setEntries setAncestors;
-        size_t nLimitAncestors = GetArg("-limitancestorcount", DEFAULT_ANCESTOR_LIMIT);
-        size_t nLimitAncestorSize = GetArg("-limitancestorsize", DEFAULT_ANCESTOR_SIZE_LIMIT)*1000;
-        size_t nLimitDescendants = GetArg("-limitdescendantcount", DEFAULT_DESCENDANT_LIMIT);
-        size_t nLimitDescendantSize = GetArg("-limitdescendantsize", DEFAULT_DESCENDANT_SIZE_LIMIT)*1000;
-        std::string errString;
-        if (!pool.CalculateMemPoolAncestors(entry, setAncestors, nLimitAncestors, nLimitAncestorSize, nLimitDescendants, nLimitDescendantSize, errString)) {
-            return state.DoS(0, false, REJECT_NONSTANDARD, "too-long-mempool-chain", false, errString);
-        }
-
-        // A transaction that spends outputs that would be replaced by it is invalid. Now
-        // that we have the set of all ancestors we can detect this
-        // pathological case by making sure setConflicts and setAncestors don't
-        // intersect.
-        for(CTxMemPool::txiter ancestorIt : setAncestors)
-        {
-            const uint256 &hashAncestor = ancestorIt->GetTx().GetHash();
-            if (setConflicts.count(hashAncestor))
-            {
-                return state.DoS(10, false,
-                                 REJECT_INVALID, "bad-txns-spends-conflicting-tx", false,
-                                 strprintf("%s spends conflicting transaction %s",
-                                           hash.ToString(),
-                                           hashAncestor.ToString()));
-            }
-        }
-
-        // Check if it's economically rational to mine this transaction rather
-        // than the ones it replaces.
-        CAmount nConflictingFees = 0;
-        size_t nConflictingSize = 0;
-        uint64_t nConflictingCount = 0;
-        CTxMemPool::setEntries allConflicting;
-
-        // If we don't hold the lock allConflicting might be incomplete; the
-        // subsequent RemoveStaged() and addUnchecked() calls don't guarantee
-        // mempool consistency for us.
-        LOCK(pool.cs);
-        const bool fReplacementTransaction = setConflicts.size();
-        if (fReplacementTransaction)
-        {
-            CFeeRate newFeeRate(nModifiedFees, nSize);
-            std::set<uint256> setConflictsParents;
-            const int maxDescendantsToVisit = 100;
-            CTxMemPool::setEntries setIterConflicting;
-            for(const uint256 &hashConflicting : setConflicts)
-            {
-                CTxMemPool::txiter mi = pool.mapTx.find(hashConflicting);
-                if (mi == pool.mapTx.end())
-                    continue;
-
-                // Save these to avoid repeated lookups
-                setIterConflicting.insert(mi);
-
-                // Don't allow the replacement to reduce the feerate of the
-                // mempool.
-                //
-                // We usually don't want to accept replacements with lower
-                // feerates than what they replaced as that would lower the
-                // feerate of the next block. Requiring that the feerate always
-                // be increased is also an easy-to-reason about way to prevent
-                // DoS attacks via replacements.
-                //
-                // The mining code doesn't (currently) take children into
-                // account (CPFP) so we only consider the feerates of
-                // transactions being directly replaced, not their indirect
-                // descendants. While that does mean high feerate children are
-                // ignored when deciding whether or not to replace, we do
-                // require the replacement to pay more overall fees too,
-                // mitigating most cases.
-                CFeeRate oldFeeRate(mi->GetModifiedFee(), mi->GetTxSize());
-                if (newFeeRate <= oldFeeRate)
-                {
-                    return state.DoS(0, false,
-                            REJECT_INSUFFICIENTFEE, "insufficient fee", false,
-                            strprintf("rejecting replacement %s; new feerate %s <= old feerate %s",
-                                  hash.ToString(),
-                                  newFeeRate.ToString(),
-                                  oldFeeRate.ToString()));
-                }
-
-                for(const CTxIn &txin : mi->GetTx().vin)
-                {
-                    setConflictsParents.insert(txin.prevout.hash);
-                }
-
-                nConflictingCount += mi->GetCountWithDescendants();
-            }
-            // This potentially overestimates the number of actual descendants
-            // but we just want to be conservative to avoid doing too much
-            // work.
-            if (nConflictingCount <= maxDescendantsToVisit) {
-                // If not too many to replace, then calculate the set of
-                // transactions that would have to be evicted
-                for(CTxMemPool::txiter it : setIterConflicting) {
-                    pool.CalculateDescendants(it, allConflicting);
-                }
-                for(CTxMemPool::txiter it : allConflicting) {
-                    nConflictingFees += it->GetModifiedFee();
-                    nConflictingSize += it->GetTxSize();
-                }
-            } else {
-                return state.DoS(0, false,
-                        REJECT_NONSTANDARD, "too many potential replacements", false,
-                        strprintf("rejecting replacement %s; too many potential replacements (%d > %d)\n",
-                            hash.ToString(),
-                            nConflictingCount,
-                            maxDescendantsToVisit));
-            }
-
-            for (unsigned int j = 0; j < tx.vin.size(); j++)
-            {
-                // We don't want to accept replacements that require low
-                // feerate junk to be mined first. Ideally we'd keep track of
-                // the ancestor feerates and make the decision based on that,
-                // but for now requiring all new inputs to be confirmed works.
-                if (!setConflictsParents.count(tx.vin[j].prevout.hash))
-                {
-                    // Rather than check the UTXO set - potentially expensive -
-                    // it's cheaper to just check if the new input refers to a
-                    // tx that's in the mempool.
-                    if (pool.mapTx.find(tx.vin[j].prevout.hash) != pool.mapTx.end())
-                        return state.DoS(0, false,
-                                         REJECT_NONSTANDARD, "replacement-adds-unconfirmed", false,
-                                         strprintf("replacement %s adds unconfirmed input, idx %d",
-                                                  hash.ToString(), j));
-                }
-            }
-
-            // The replacement must pay greater fees than the transactions it
-            // replaces - if we did the bandwidth used by those conflicting
-            // transactions would not be paid for.
-            if (nModifiedFees < nConflictingFees)
-            {
-                return state.DoS(0, false,
-                                 REJECT_INSUFFICIENTFEE, "insufficient fee", false,
-                                 strprintf("rejecting replacement %s, less fees than conflicting txs; %s < %s",
-                                          hash.ToString(), FormatMoney(nModifiedFees), FormatMoney(nConflictingFees)));
-            }
-
-            // Finally in addition to paying more fees than the conflicts the
-            // new transaction must pay for its own bandwidth.
-            CAmount nDeltaFees = nModifiedFees - nConflictingFees;
-            if (nDeltaFees < ::incrementalRelayFee.GetFee(nSize))
-            {
-                return state.DoS(0, false,
-                        REJECT_INSUFFICIENTFEE, "insufficient fee", false,
-                        strprintf("rejecting replacement %s, not enough additional fees to relay; %s < %s",
-                              hash.ToString(),
-                              FormatMoney(nDeltaFees),
-                              FormatMoney(::incrementalRelayFee.GetFee(nSize))));
-            }
-        }
-
-        unsigned int scriptVerifyFlags = STANDARD_SCRIPT_VERIFY_FLAGS;
-        if (!chainparams.RequireStandard()) {
-            scriptVerifyFlags = GetArg("-promiscuousmempoolflags", scriptVerifyFlags);
-        }
-
-        // Check against previous transactions
-        // This is done last to help prevent CPU exhaustion denial-of-service attacks.
-        PrecomputedTransactionData txdata(tx);
-        if (!CheckInputs(tx, state, view, true, scriptVerifyFlags, true, txdata, &witnessBundles)) {
-            // SCRIPT_VERIFY_CLEANSTACK requires SCRIPT_VERIFY_WITNESS, so we
-            // need to turn both off, and compare against just turning off CLEANSTACK
-            // to see if the failure is specifically due to witness validation.
-            CValidationState stateDummy; // Want reported failures to be from first CheckInputs
-            if (!tx.HasWitness() && CheckInputs(tx, stateDummy, view, true, scriptVerifyFlags & ~(SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_CLEANSTACK), true, txdata, nullptr) &&
-                !CheckInputs(tx, stateDummy, view, true, scriptVerifyFlags & ~SCRIPT_VERIFY_CLEANSTACK, true, txdata, nullptr)) {
-                // Only the witness is missing, so the transaction itself may be fine.
-                state.SetCorruptionPossible();
-            }
-            return false; // state filled in by CheckInputs
-        }
-
-        // Check again against just the consensus-critical mandatory script
-        // verification flags, in case of bugs in the standard flags that cause
-        // transactions to pass as valid when they're actually invalid. For
-        // instance the STRICTENC flag was incorrectly allowing certain
-        // CHECKSIG NOT scripts to pass, even though they were invalid.
-        //
-        // There is a similar check in CreateNewBlock() to prevent creating
-        // invalid blocks, however allowing such transactions into the mempool
-        // can be exploited as a DoS attack.
-        if (!CheckInputs(tx, state, view, true, MANDATORY_SCRIPT_VERIFY_FLAGS, true, txdata, nullptr))
-        {
-            return error("%s: BUG! PLEASE REPORT THIS! ConnectInputs failed against MANDATORY but not STANDARD flags %s, %s",
-                __func__, hash.ToString(), FormatStateMessage(state));
-        }
-
-        // Remove conflicting transactions from the mempool
-        for(const CTxMemPool::txiter it : allConflicting)
-        {
-            LogPrint(BCLog::MEMPOOL, "replacing tx %s with %s for %s NLG additional fees, %d delta bytes\n",
-                    it->GetTx().GetHash().ToString(),
-                    hash.ToString(),
-                    FormatMoney(nModifiedFees - nConflictingFees),
-                    (int)nSize - (int)nConflictingSize);
-            if (plTxnReplaced)
-                plTxnReplaced->push_back(it->GetSharedTx());
-        }
-        pool.RemoveStaged(allConflicting, false, MemPoolRemovalReason::REPLACED);
-
-        // This transaction should only count for fee estimation if it isn't a
-        // BIP 125 replacement transaction (may not be widely supported), the
-        // node is not behind, and the transaction is not dependent on any other
-        // transactions in the mempool.
-        bool validForFeeEstimation = !fReplacementTransaction && IsCurrentForFeeEstimation() && pool.HasNoInputsOf(tx);
-
-        // Store transaction in memory
-        pool.addUnchecked(hash, entry, setAncestors, validForFeeEstimation);
-
-        // trim mempool and check if tx was trimmed
-        if (!fOverrideMempoolLimit) {
-            LimitMempoolSize(pool, GetArg("-maxmempool", DEFAULT_MAX_MEMPOOL_SIZE) * 1000000, GetArg("-mempoolexpiry", DEFAULT_MEMPOOL_EXPIRY) * 60 * 60);
-            if (!pool.exists(hash))
-                return state.DoS(0, false, REJECT_INSUFFICIENTFEE, "mempool full");
-        }
-    }
-
-    GetMainSignals().TransactionAddedToMempool(ptx);
-
-    return true;
-}
-
-/** (try to) add transaction to memory pool with a specified acceptance time **/
-static bool AcceptToMemoryPoolWithTime(const CChainParams& chainparams, CTxMemPool& pool, CValidationState &state, const CTransactionRef &tx, bool fLimitFree,
-                        bool* pfMissingInputs, int64_t nAcceptTime, std::list<CTransactionRef>* plTxnReplaced,
-                        bool fOverrideMempoolLimit, const CAmount nAbsurdFee)
-{
-    std::vector<COutPoint> coins_to_uncache;
-    bool res = AcceptToMemoryPoolWorker(chainparams, pool, state, tx, fLimitFree, pfMissingInputs, nAcceptTime, plTxnReplaced, fOverrideMempoolLimit, nAbsurdFee, coins_to_uncache);
-    if (!res) {
-        for(const COutPoint& hashTx : coins_to_uncache)
-            pcoinsTip->Uncache(hashTx);
-    }
-    // After we've (potentially) uncached entries, ensure our coins cache is still within its size limits
-    CValidationState stateDummy;
-    FlushStateToDisk(chainparams, stateDummy, FLUSH_STATE_PERIODIC);
-    return res;
-}
-
-bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransactionRef &tx, bool fLimitFree,
-                        bool* pfMissingInputs, std::list<CTransactionRef>* plTxnReplaced,
-                        bool fOverrideMempoolLimit, const CAmount nAbsurdFee)
-{
-    const CChainParams& chainparams = Params();
-    return AcceptToMemoryPoolWithTime(chainparams, pool, state, tx, fLimitFree, pfMissingInputs, GetTime(), plTxnReplaced, fOverrideMempoolLimit, nAbsurdFee);
-}
-
-/** Return transaction in txOut, and if it was found inside a block, its hash is placed in hashBlock */
-bool GetTransaction(const uint256 &hash, CTransactionRef &txOut, const Consensus::Params& consensusParams, uint256 &hashBlock, bool fAllowSlow)
-{
-    CBlockIndex *pindexSlow = NULL;
-
-    LOCK(cs_main); // Required for ReadBlockFromDisk.
-
-    CTransactionRef ptx = mempool.get(hash);
-    if (ptx)
-    {
-        txOut = ptx;
-        return true;
-    }
-
-    if (fTxIndex) {
-        CDiskTxPos postx;
-        if (pblocktree->ReadTxIndex(hash, postx)) {
-            CFile file(blockStore.GetBlockFile(postx, true), SER_DISK, CLIENT_VERSION);
-            if (file.IsNull())
-                return error("%s: OpenBlockFile failed", __func__);
-            CBlockHeader header;
-            try {
-                file >> header;
-                fseek(file.Get(), postx.nTxOffset, SEEK_CUR);
-                file >> txOut;
-            } catch (const std::exception& e) {
-                return error("%s: Deserialize or I/O error - %s", __func__, e.what());
-            }
-            hashBlock = header.GetHashPoW2();
-            if (txOut->GetHash() != hash)
-                return error("%s: txid mismatch", __func__);
-            return true;
-        }
-    }
-
-    if (fAllowSlow) { // use coin database to locate block that contains transaction, and scan it
-        const Coin& coin = AccessByTxid(*pcoinsTip, hash);
-        if (!coin.IsSpent()) pindexSlow = chainActive[coin.nHeight];
-    }
-
-    if (pindexSlow) {
-        CBlock block;
-        if (ReadBlockFromDisk(block, pindexSlow, consensusParams)) {
-            for (const auto& tx : block.vtx) {
-                if (tx->GetHash() == hash) {
-                    txOut = tx;
-                    hashBlock = pindexSlow->GetBlockHashPoW2();
-                    return true;
-                }
-            }
-        }
-    }
-
-    return false;
-}
-
-
-
 
 
 
@@ -953,59 +310,6 @@ bool ReadBlockFromDisk(CBlock& block, const CBlockIndex* pindex, const Consensus
     return true;
 }
 
-CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams)
-{
-    CAmount nSubsidy = 0;
-    if(nHeight == 1) //First block premine
-    {
-        nSubsidy = 170000000 * COIN;
-    }
-    else if(nHeight <= 250000) // 1000 Gulden per block for first 250k blocks
-    {
-        nSubsidy = 1000 * COIN; 
-    }
-    else if(nHeight <= 12850000) // Switch to fixed reward of 100 Gulden per block (no halving) - to continue until original coin target is met.
-    {
-        nSubsidy = 100 * COIN; 
-    }
-    return nSubsidy;
-}
-
-CAmount GetBlockSubsidyWitness(int nHeight, const Consensus::Params& consensusParams)
-{
-    CAmount nSubsidy = 0;
-    if (nHeight <= 12850000) // Switch to fixed reward of 100 Gulden per block (no halving) - to continue until original coin target is met.
-    {
-        nSubsidy = 20 * COIN;
-    }
-    return nSubsidy;
-}
-
-bool IsInitialBlockDownload()
-{
-    //AssertLockHeld(cs_main);
-    const CChainParams& chainParams = Params();
-
-    // Once this function has returned false, it must remain false.
-    static std::atomic<bool> latchToFalse{false};
-    // Optimization: pre-test latch before taking the lock.
-    if (latchToFalse.load(std::memory_order_relaxed))
-        return false;
-
-    if (latchToFalse.load(std::memory_order_relaxed))
-        return false;
-    if (fImporting || fReindex)
-        return true;
-    if (chainActive.Tip() == NULL)
-        return true;
-    if (chainActive.Tip()->nChainWork < UintToArith256(chainParams.GetConsensus().nMinimumChainWork))
-        return true;
-    if (chainActive.Tip()->GetBlockTime() < (GetTime() - nMaxTipAge))
-        return true;
-    LogPrintf("Leaving InitialBlockDownload (latching to false)\n");
-    latchToFalse.store(true, std::memory_order_relaxed);
-    return false;
-}
 
 CBlockIndex *pindexBestForkTip = NULL, *pindexBestForkBase = NULL;
 #if 0
@@ -1164,7 +468,9 @@ int GetSpendHeight(const CCoinsViewCache& inputs)
     return pindexPrev->nHeight + 1;
 }
 
-CScript&& GetScriptForNonScriptOutput(const CTxOut& out)
+//fixme: (2.0) This should rather use move semantics, but CScript doesn't currently seem compatible with this.
+//fixme: (2.0) Use this in places that are hardcoded instead.
+CScript GetScriptForNonScriptOutput(const CTxOut& out)
 {
     if (out.GetType() <= CTxOutType::PoW2WitnessOutput)
     {
@@ -1173,7 +479,7 @@ CScript&& GetScriptForNonScriptOutput(const CTxOut& out)
     }
     else if (out.GetType() <= CTxOutType::StandardKeyHashOutput)
     {
-        std::vector<unsigned char> sWitnessPlaceholder = {'p','o','w','2','w','i','t','n','e','s','s'};
+        std::vector<unsigned char> sWitnessPlaceholder = {'k','e','y','h','a','s','h'};
         return CScript(sWitnessPlaceholder.begin(), sWitnessPlaceholder.end());
     }
     else
@@ -1189,7 +495,7 @@ CScript&& GetScriptForNonScriptOutput(const CTxOut& out)
  * This does not modify the UTXO set. If pvChecks is not NULL, script checks are pushed onto it
  * instead of being performed inline.
  */
-static bool CheckInputs(const CTransaction& tx, CValidationState &state, const CCoinsViewCache &inputs, bool fScriptChecks, unsigned int flags, bool cacheStore, PrecomputedTransactionData& txdata, std::vector<CWitnessTxBundle>* pWitnessBundles, std::vector<CScriptCheck> *pvChecks)
+bool CheckInputs(const CTransaction& tx, CValidationState &state, const CCoinsViewCache &inputs, bool fScriptChecks, unsigned int flags, bool cacheStore, PrecomputedTransactionData& txdata, std::vector<CWitnessTxBundle>* pWitnessBundles, std::vector<CScriptCheck> *pvChecks)
 {
     if (!tx.IsCoinBase() || tx.IsPoW2WitnessCoinBase())
     {
@@ -1338,10 +644,8 @@ bool AbortNode(const std::string& strMessage, const std::string& userMessage="")
 {
     SetMiscWarning(strMessage);
     LogPrintf("*** %s\n", strMessage);
-    uiInterface.ThreadSafeMessageBox(
-        userMessage.empty() ? _("Error: A fatal internal error occurred, see debug.log for details") : userMessage,
-        "", CClientUIInterface::MSG_ERROR);
-    StartShutdown();
+    uiInterface.ThreadSafeMessageBox(userMessage.empty() ? _("Error: A fatal internal error occurred, see debug.log for details") : userMessage, "", CClientUIInterface::MSG_ERROR);
+    GuldenAppManager::gApp->shutdown();
     return false;
 }
 
@@ -1352,13 +656,6 @@ bool AbortNode(CValidationState& state, const std::string& strMessage, const std
 }
 
 } // anon namespace
-
-enum DisconnectResult
-{
-    DISCONNECT_OK,      // All good.
-    DISCONNECT_UNCLEAN, // Rolled back, but UTXO set was inconsistent with block.
-    DISCONNECT_FAILED   // Something else went wrong.
-};
 
 /**
  * Restore the UTXO in a Coin at a given COutPoint
@@ -1390,9 +687,8 @@ int ApplyTxInUndo(Coin&& undo, CCoinsViewCache& view, const COutPoint& out)
     return fClean ? DISCONNECT_OK : DISCONNECT_UNCLEAN;
 }
 
-/** Undo the effects of this block (with given index) on the UTXO set represented by coins.
- *  When UNCLEAN or FAILED is returned, view is left in an indeterminate state. */
-static DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view)
+
+DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view)
 {
     assert(pindex->GetBlockHashPoW2() == view.GetBestBlock());
 
@@ -1511,52 +807,6 @@ void ThreadScriptCheck() {
 // Protected by cs_main
 VersionBitsCache versionbitscache;
 
-
-bool HaveRequiredPeerUpgradePercent(int nRequiredProtoVersion, unsigned int nRequiredPercent)
-{
-    std::vector<CNodeStats> vstats;
-    g_connman->GetNodeStats(vstats);
-
-    // Insufficient peers to determine.
-    if (vstats.size() < 3)
-    {
-        if (IsArgSet("-testnet"))
-            return true;
-
-        return false;
-    }
-
-    int nUpgradeCount = 0;
-    for (const CNodeStats& stats : vstats)
-    {
-        if (stats.nVersion >= nRequiredProtoVersion)
-        {
-            ++nUpgradeCount;
-        }
-    }
-    return (100 * nUpgradeCount) / vstats.size() > nRequiredPercent;
-}
-
-//fixme: (2.0) next high - does this need to take a chain paramater?
-int32_t ComputeBlockVersion(const CBlockIndex* pindexPrev, const Consensus::Params& params)
-{
-    LOCK(cs_main);
-    int32_t nVersion = VERSIONBITS_TOP_BITS;
-
-    for (int i = 0; i < (int)Consensus::MAX_VERSION_BITS_DEPLOYMENTS; i++) {
-        ThresholdState state = VersionBitsState(pindexPrev, params, (Consensus::DeploymentPos)i, versionbitscache);
-        if (state == THRESHOLD_LOCKED_IN || state == THRESHOLD_STARTED) {
-            //fixme: (2.0) (POW2) Make same change in RPC mining code.
-            if (params.vDeployments[i].protoVersion == 0 || HaveRequiredPeerUpgradePercent(params.vDeployments[i].protoVersion, params.vDeployments[i].requiredProtoUpgradePercent))
-            {
-                nVersion |= VersionBitsMask(params, (Consensus::DeploymentPos)i);
-            }
-        }
-    }
-
-    return nVersion;
-}
-
 /**
  * Threshold condition checker that triggers when unknown versionbits are seen on the network.
  */
@@ -1581,23 +831,6 @@ public:
     }
 };
 
-//fixme: (2.1) Can remove this.
-int GetPoW2WitnessCoinbaseIndex(const CBlock& block)
-{
-    int commitpos = -1;
-    if (!block.vtx.empty()) {
-        for (size_t o = 0; o < block.vtx[0]->vout.size(); o++) {
-            if (block.vtx[0]->vout[o].GetType() <= CTxOutType::ScriptLegacyOutput)
-            {
-                if (block.vtx[0]->vout[o].output.scriptPubKey.size() == 143 && block.vtx[0]->vout[o].output.scriptPubKey[0] == OP_RETURN && block.vtx[0]->vout[o].output.scriptPubKey[1] == 0x50 && block.vtx[0]->vout[o].output.scriptPubKey[2] == 0x6f && block.vtx[0]->vout[o].output.scriptPubKey[3] == 0x57 && block.vtx[0]->vout[o].output.scriptPubKey[4] == 0xc2 && block.vtx[0]->vout[o].output.scriptPubKey[5] == 0xb2) {
-                    commitpos = o;
-                }
-            }
-        }
-    }
-    return commitpos;
-}
-
 // Protected by cs_main
 static ThresholdConditionCache warningcache[VERSIONBITS_NUM_BITS];
 
@@ -1609,14 +842,11 @@ static int64_t nTimeIndex = 0;
 static int64_t nTimeCallbacks = 0;
 static int64_t nTimeTotal = 0;
 
-//fixme: (2.1) Remove this double ContextualCheckBlock nonsense, see comment above actual function.
-static bool ContextualCheckBlock(const CBlock& block, CValidationState& state, const CChainParams& chainParams, const CBlockIndex* pindexPrev, CChain& chainOverride, CCoinsViewCache* viewOverride=nullptr, bool doUTXOChecks=false);
-
 /** Apply the effects of this block (with given index) on the UTXO set represented by coins.
  *  Validity checks that depend on the UTXO set are also done; ConnectBlock()
  *  can fail if those validity checks fail (among other reasons). */
-static bool ConnectBlock(CChain& chain, const CBlock& block, CValidationState& state, CBlockIndex* pindex,
-                  CCoinsViewCache& view, const CChainParams& chainparams, bool fJustCheck = false, bool fVerifyWitness=true)
+bool ConnectBlock(CChain& chain, const CBlock& block, CValidationState& state, CBlockIndex* pindex,
+                  CCoinsViewCache& view, const CChainParams& chainparams, bool fJustCheck, bool fVerifyWitness)
 {
     if (!ContextualCheckBlock(block, state, chainparams, pindex->pprev, chain, &view, true))
         return error("%s: Consensus::CheckBlock, failed ContextualCheckBlock with utxo check: %s", __func__, FormatStateMessage(state));
@@ -1885,8 +1115,13 @@ static bool ConnectBlock(CChain& chain, const CBlock& block, CValidationState& s
             if (!tx.IsCoinBase())
             {
                 if (!view.HaveInputs(tx))
-                    return state.DoS(100, error("ConnectBlock(): inputs missing/spent"),
-                                    REJECT_INVALID, "bad-txns-inputs-missingorspent");
+                {
+                    //fixme: (2.0) - Low level fix for problem of conflicting transaction entering mempool and causing miners to be unable to mine (due to selecting invalid transactions for block continuously).
+                    //This fix should remain in place, but a follow up fix is needed to try stop the conflicting transaction entering the mempool to begin with - need to hunt the source of this down.
+                    //Seems to have something to do with a double (conflicting) witness renewal transaction.
+                    mempool.removeRecursive(tx, MemPoolRemovalReason::CONFLICT);
+                    return state.DoS(100, error("ConnectBlock(): inputs missing/spent"), REJECT_INVALID, "bad-txns-inputs-missingorspent");
+                }
 
                 // Check that transaction is BIP68 final
                 // BIP68 lock checks (as opposed to nLockTime checks) must
@@ -2080,66 +1315,13 @@ static bool ConnectBlock(CChain& chain, const CBlock& block, CValidationState& s
     return true;
 }
 
-std::vector<CBlockIndex*> GetTopLevelPoWOrphans(const int64_t nHeight, const uint256& prevHash)
-{
-    LOCK(cs_main);
-    std::vector<CBlockIndex*> vRet;
-    for (const auto candidateIter : setBlockIndexCandidates)
-    {
-        if (candidateIter->nVersionPoW2Witness == 0)
-        {
-            if (candidateIter->nHeight >= nHeight)
-            {
-                vRet.push_back(candidateIter);
-            }
-        }
-    }
-    return vRet;
-}
-
-std::vector<CBlockIndex*> GetTopLevelWitnessOrphans(const int64_t nHeight)
-{
-    LOCK(cs_main);
-    std::vector<CBlockIndex*> vRet;
-    for (const auto candidateIter : setBlockIndexCandidates)
-    {
-        if (candidateIter->nVersionPoW2Witness != 0)
-        {
-            if (candidateIter->nHeight >= nHeight)
-            {
-                vRet.push_back(candidateIter);
-            }
-        }
-    }
-    return vRet;
-}
-
-CBlockIndex* GetWitnessOrphanForBlock(const int64_t nHeight, const uint256& prevHash, const uint256& powHash)
-{
-    LOCK(cs_main);
-    for (const auto candidateIter : setBlockIndexCandidates)
-    {
-        if (candidateIter->nVersionPoW2Witness != 0)
-        {
-            if (candidateIter->nHeight == nHeight && candidateIter->pprev && *candidateIter->pprev->phashBlock == prevHash)
-            {
-                if (candidateIter->GetBlockHashLegacy() == powHash)
-                {
-                    return candidateIter;
-                }
-            }
-        }
-    }
-    return NULL;
-}
-
 /**
  * Update the on-disk chain state.
  * The caches and indexes are flushed depending on the mode we're called with
  * if they're too large, if it's been a while since the last write,
  * or always and in all cases if we're in prune mode and are deleting files.
  */
-bool static FlushStateToDisk(const CChainParams& chainparams, CValidationState &state, FlushStateMode mode, int nManualPruneHeight) {
+bool FlushStateToDisk(const CChainParams& chainparams, CValidationState &state, FlushStateMode mode, int nManualPruneHeight) {
     int64_t nMempoolUsage = mempool.DynamicMemoryUsage();
     LOCK2(cs_main, cs_LastBlockFile);
     static int64_t nLastWrite = 0;
@@ -2743,7 +1925,8 @@ bool ActivateBestChain(CValidationState &state, const CChainParams& chainparams,
             uiInterface.NotifyBlockTip(fInitialDownload, pindexNewTip);
         }
 
-        if (nStopAtHeight && pindexNewTip && pindexNewTip->nHeight >= nStopAtHeight) StartShutdown();
+        if (nStopAtHeight && pindexNewTip && pindexNewTip->nHeight >= nStopAtHeight)
+            GuldenAppManager::gApp->shutdown();
     } while (pindexNewTip != pindexMostWork);
     CheckBlockIndex(chainparams.GetConsensus());
 
@@ -2753,396 +1936,6 @@ bool ActivateBestChain(CValidationState &state, const CChainParams& chainparams,
     }
 
     return true;
-}
-
-static bool ForceActivateChainStep(CValidationState& state, CChain& currentChain, const CChainParams& chainparams, CBlockIndex* pindexMostWork, const std::shared_ptr<const CBlock>& pblock, bool& fInvalidFound, ConnectTrace& connectTrace, CCoinsViewCache& coinView)
-{
-    AssertLockHeld(cs_main); // Required for ReadBlockFromDisk.
-    const CBlockIndex *pindexFork = currentChain.FindFork(pindexMostWork);
-
-    if (!pindexFork)
-    {
-        while (currentChain.Tip() && currentChain.Tip()->nHeight >= pindexMostWork->nHeight - 1)
-        {
-            CBlockIndex* pindexNew = currentChain.Tip()->pprev;
-            std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
-            CBlock& block = *pblock;
-            if (!ReadBlockFromDisk(block, currentChain.Tip(), chainparams.GetConsensus()))
-                return false;
-            if (DisconnectBlock(block, currentChain.Tip(), coinView) != DISCONNECT_OK)
-                return false;
-            currentChain.SetTip(pindexNew);
-        }
-        pindexFork = currentChain.FindFork(pindexMostWork);
-    }
-
-    // Disconnect active blocks which are no longer in the best chain.
-    while (currentChain.Tip() && currentChain.Tip() != pindexFork) {
-        CBlockIndex* pindexNew = currentChain.Tip()->pprev;
-        std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
-        CBlock& block = *pblock;
-        if (!ReadBlockFromDisk(block, currentChain.Tip(), chainparams.GetConsensus()))
-            return false;
-        if (DisconnectBlock(block, currentChain.Tip(), coinView) != DISCONNECT_OK)
-            return false;
-        currentChain.SetTip(pindexNew);
-    }
-
-    // Build list of new blocks to connect.
-    std::vector<CBlockIndex*> vpindexToConnect;
-    bool fContinue = true;
-    int nHeight = pindexFork ? pindexFork->nHeight : -1;
-    while (fContinue && nHeight != pindexMostWork->nHeight) {
-        // Don't iterate the entire list of potential improvements toward the best tip, as we likely only need
-        // a few blocks along the way.
-        int nTargetHeight = std::min(nHeight + 32, pindexMostWork->nHeight);
-        vpindexToConnect.clear();
-        vpindexToConnect.reserve(nTargetHeight - nHeight);
-        CBlockIndex *pindexIter = pindexMostWork->GetAncestor(nTargetHeight);
-        while (pindexIter && pindexIter->nHeight != nHeight) {
-            vpindexToConnect.push_back(pindexIter);
-            pindexIter = pindexIter->pprev;
-        }
-        nHeight = nTargetHeight;
-
-        // Connect new blocks.
-        BOOST_REVERSE_FOREACH(CBlockIndex *pindexConnect, vpindexToConnect) {
-            std::shared_ptr<CBlock> pblockConnect = nullptr;
-            if (pindexConnect != pindexMostWork || !pblock)
-            {
-                pblockConnect = std::make_shared<CBlock>();
-                CBlock& block = *pblockConnect;
-                if (!ReadBlockFromDisk(block, pindexConnect, chainparams.GetConsensus()))
-                    return false;
-            }
-            bool rv = ConnectBlock(currentChain, pblockConnect?*pblockConnect:*pblock, state, pindexConnect, coinView, chainparams);
-            if (!rv)
-                return false;
-            currentChain.SetTip(pindexConnect);
-        }
-    }
-
-    return true;
-}
-
-
-// pblock is either NULL or a pointer to a CBlock corresponding to pActiveIndex, to bypass loading it again from disk.
-bool ForceActivateChain(CBlockIndex* pActivateIndex, std::shared_ptr<const CBlock> pblock, CValidationState& state, const CChainParams& chainparams, CChain& currentChain, CCoinsViewCache& coinView) {
-    CBlockIndex* pindexNewTip = nullptr;
-    do {
-        {
-            LOCK(cs_main);
-            ConnectTrace connectTrace(mempool);
-
-            // Whether we have anything to do at all.
-            if (pActivateIndex == NULL || pActivateIndex == currentChain.Tip())
-                return true;
-
-            bool fInvalidFound = false;
-            std::shared_ptr<const CBlock> nullBlockPtr;
-            if (!ForceActivateChainStep(state, currentChain, chainparams, pActivateIndex, pblock, fInvalidFound, connectTrace, coinView))
-                return false;
-
-            if (fInvalidFound) {
-                return false;
-            }
-            pindexNewTip = currentChain.Tip();
-        }
-        // When we reach this point, we switched to a new tip (stored in pindexNewTip).
-
-        //fixme: (2.0) - I think we can remove this now, but make sure?
-        // Disallow the following as they should never happen:
-        // 1) Activating a witness block as tip during phase 3 is an error.
-        // 2) Activating an unwitnessed PoW block as tip for phase 3.
-        // 3) Activating a PoW block as tip from phase 4 onwards...
-        /*if (pindexNewTip->pprev && IsPow2Phase3Active(pindexNewTip->pprev->pprev, chainparams.GetConsensus()) && !IsPow2Phase4Active(pindexNewTip->pprev, chainparams.GetConsensus()))
-        {
-            assert(pindexNewTip->nVersionPoW2Witness == 0);
-            assert (GetWitnessOrphanForBlock(pindexNewTip->nHeight, pindexNewTip->pprev->GetBlockHashLegacy(), pindexNewTip->GetBlockHashLegacy()) != NULL);
-        }
-        if (GetPoW2Phase(pindexNewTip->pprev, chainparams.GetConsensus()) >= 4)
-        {
-            assert(pindexNewTip->nVersionPoW2Witness != 0);
-        }*/
-    } while (pindexNewTip != pActivateIndex);
-
-    return true;
-}
-
-bool ForceActivateChainWithBlockAsTip(CBlockIndex* pActivateIndex, std::shared_ptr<const CBlock> pblock, CValidationState& state, const CChainParams& chainparams, CChain& currentChain, CCoinsViewCache& coinView, CBlockIndex* pnewblockastip)
-{
-    if(!ForceActivateChain(pActivateIndex, pblock, state, chainparams, currentChain, coinView))
-        return false;
-    return ForceActivateChain(pnewblockastip, nullptr, state, chainparams, currentChain, coinView);
-}
-
-uint64_t expectedWitnessBlockPeriod(uint64_t nWeight, uint64_t networkTotalWeight)
-{
-    if (nWeight == 0 || networkTotalWeight == 0)
-        return 0;
-
-    if (nWeight > networkTotalWeight/100)
-        nWeight = networkTotalWeight/100;
-
-    static const arith_uint256 base = arith_uint256(100000000) * arith_uint256(100000000) * arith_uint256(100000000);
-    #define BASE(x) (arith_uint256(x)*base)
-    #define AI(x) arith_uint256(x)
-    return 100 + std::max(( ((BASE(1)/((BASE(nWeight)/AI(networkTotalWeight))))).GetLow64() * 5 ), (uint64_t)500);
-    #undef AI
-    #undef BASE
-}
-
-uint64_t estimatedWitnessBlockPeriod(uint64_t nWeight, uint64_t networkTotalWeight)
-{
-    if (nWeight == 0 || networkTotalWeight == 0)
-        return 0;
-
-    if (nWeight > networkTotalWeight/100)
-        nWeight = networkTotalWeight/100;
-
-    static const arith_uint256 base = arith_uint256(100000000) * arith_uint256(100000000) * arith_uint256(100000000);
-    #define BASE(x) (arith_uint256(x)*base)
-    #define AI(x) arith_uint256(x)
-    return 100 + ((BASE(1)/((BASE(nWeight)/AI(networkTotalWeight))))).GetLow64();
-    #undef AI
-    #undef BASE
-}
-
-
-bool getAllUnspentWitnessCoins(CChain& chain, const CChainParams& chainParams, const CBlockIndex* pPreviousIndexChain_, std::map<COutPoint, Coin>& allWitnessCoins, CBlock* newBlock, CCoinsViewCache* viewOverride)
-{
-    LOCK2(cs_main, pactiveWallet?&pactiveWallet->cs_wallet:NULL);
-    assert(pPreviousIndexChain_);
-
-    allWitnessCoins.clear();
-    //fixme: (2.0) (PoW2) Error handling
-    // Sort out pre-conditions.
-    // We have to make sure that we are using a view and chain that includes the PoW block we are witnessing and all of its transactions as the tip.
-    // It won't necessarily be part of the chain yet; if we are in the process of witnessing; or if the block is an older one on a fork; because only blocks that have already been witnessed can be part of the chain.
-    // So we have to temporarily force disconnect/reconnect of blocks as necessary to make a temporary working chain that suits the properties we want.
-    // NB!!! - It is important that we don't flush either of these before destructing, we want to throw the result away.
-    CCoinsViewCache viewNew(viewOverride?viewOverride:pcoinsTip);
-
-    // fixme: (2.1) SBSU - We really don't need to clone the entire chain here, could we clone just the last 1000 or something?
-    // We work on a clone of the chain to prevent modifying the actual chain.
-    CBlockIndex* pPreviousIndexChain = nullptr;
-    CCloneChain tempChain = chain.Clone(pPreviousIndexChain_, pPreviousIndexChain);
-    CValidationState state;
-    assert(pPreviousIndexChain);
-
-    // Force the tip of the chain to the block that comes before the block we are examining.
-    // For phase 3 this must be a PoW block - from phase 4 it should be a witness block 
-    if (pPreviousIndexChain->nVersionPoW2Witness==0 || IsPow2Phase4Active(pPreviousIndexChain->pprev, chainParams, tempChain, &viewNew))
-    {
-        ForceActivateChain(pPreviousIndexChain, nullptr, state, chainParams, tempChain, viewNew);
-    }
-    else
-    {
-        CBlockIndex* pPreviousIndexChainPoW = new CBlockIndex(*GetPoWBlockForPoSBlock(pPreviousIndexChain));
-        assert(pPreviousIndexChainPoW);
-        pPreviousIndexChainPoW->pprev = pPreviousIndexChain->pprev;
-        ForceActivateChainWithBlockAsTip(pPreviousIndexChain->pprev, nullptr, state, chainParams, tempChain, viewNew, pPreviousIndexChainPoW);
-        pPreviousIndexChain = tempChain.Tip();
-    }
-
-    // If we have been passed a new tip block (not yet part of the chain) then add it to the chain now.
-    if (newBlock)
-    {
-        // Strip any witness information from the block we have been given we want a non-witness block as the tip in order to calculate the witness for it.
-        if (newBlock->nVersionPoW2Witness != 0)
-        {
-            for (unsigned int i = 1; i < newBlock->vtx.size(); i++)
-            {
-                if (newBlock->vtx[i]->IsCoinBase() && newBlock->vtx[i]->IsPoW2WitnessCoinBase())
-                {
-                    while (newBlock->vtx.size() > i)
-                    {
-                        newBlock->vtx.pop_back();
-                    }
-                    break;
-                }
-            }
-            newBlock->nVersionPoW2Witness = 0;
-            newBlock->nTimePoW2Witness = 0;
-            newBlock->hashMerkleRootPoW2Witness = uint256();
-            newBlock->witnessHeaderPoW2Sig.clear();
-        }
-
-        // Place the block in question at the tip of the chain.
-        CBlockIndex indexDummy(*newBlock);
-        indexDummy.pprev = pPreviousIndexChain;
-        indexDummy.nHeight = pPreviousIndexChain->nHeight + 1;
-        if (!ConnectBlock(tempChain, *newBlock, state, &indexDummy, viewNew, chainParams, true, false))
-        {
-            //fixme: (2.0) If we are inside a GetWitness call ban the peer that sent us this?
-            return false;
-        }
-    }
-
-    /** Gather a list of all unspent witness outputs.
-        NB!!! There are multiple layers of cache at play here, with insertions/deletions possibly having taken place at each layer.
-        Therefore the order of operations is crucial, we must first iterate the lowest layer, then the second lowest and finally the highest layer.
-        For each iteration we should remove items from allWitnessCoins if they have been deleted in the higher layer as the higher layer overrides the lower layer.
-        GetAllCoins takes care of all of this automatically.
-    **/
-    viewNew.pChainedWitView->GetAllCoins(allWitnessCoins);
-
-    return true;
-}
-
-
-
-//fixme: (2.0) NEXT.
-//Proper error handling.
-//Handle pruning.
-// Check whether we have ever pruned block & undo files
-//pblocktree->ReadFlag("prunedblockfiles", fHavePruned);
-bool GetWitnessHelper(CChain& chain, const CChainParams& chainParams, CCoinsViewCache* viewOverride, CBlockIndex* pPreviousIndexChain, uint256 blockHash, CGetWitnessInfo& witnessInfo, uint64_t nBlockHeight)
-{
-    LOCK2(cs_main, pactiveWallet?&pactiveWallet->cs_wallet:nullptr);
-
-    /** Generate the pool of potential witnesses for the given block index **/
-    /** Addresses older than 10000 blocks or younger than 100 blocks are discarded **/
-    uint64_t nMinAge = nMinimumParticipationAge;
-    while (true)
-    {
-        witnessInfo.witnessSelectionPoolFiltered.clear();
-        witnessInfo.witnessSelectionPoolFiltered = witnessInfo.witnessSelectionPoolUnfiltered;
-
-        //LogPrint(BCLog::WITNESS, "Witness pool size1b: %d minage: %d\n", witnessInfo.witnessSelectionPoolFiltered.size(), nMinAge);
-        /** Eliminate addresses that have witnessed within the last `nMinimumParticipationAge` blocks **/
-        witnessInfo.witnessSelectionPoolFiltered.erase(std::remove_if(witnessInfo.witnessSelectionPoolFiltered.begin(), witnessInfo.witnessSelectionPoolFiltered.end(), [&](RouletteItem& x){ return (x.nAge <= nMinAge); }), witnessInfo.witnessSelectionPoolFiltered.end());
-        //LogPrint(BCLog::WITNESS, "Witness pool size1a %d minage: %d\n", witnessInfo.witnessSelectionPoolFiltered.size(), nMinAge);
-
-        /** Eliminate addresses that have not witnessed within the expected period of time that they should have **/
-        //LogPrint(BCLog::WITNESS, "Witness pool size2b: %d minage: %d\n", witnessInfo.witnessSelectionPoolFiltered.size(), nMinAge);
-        witnessInfo.witnessSelectionPoolFiltered.erase(std::remove_if(witnessInfo.witnessSelectionPoolFiltered.begin(), witnessInfo.witnessSelectionPoolFiltered.end(), [&](RouletteItem& x){ return witnessHasExpired(x.nAge, x.nWeight, witnessInfo.nTotalWeight); }), witnessInfo.witnessSelectionPoolFiltered.end());
-        //LogPrint(BCLog::WITNESS, "Witness pool size2a: %d minage: %d\n", witnessInfo.witnessSelectionPoolFiltered.size(), nMinAge);
-
-        //fixme: (2.0) check for off by 1 error.
-        /** Eliminate addresses that are within 100 blocks from lock period expiring, or whose lock period has expired. **/
-        //LogPrint(BCLog::WITNESS, "Witness pool size3b: %d minage: %d\n", witnessInfo.witnessSelectionPoolFiltered.size(), nMinAge);
-        witnessInfo.witnessSelectionPoolFiltered.erase(std::remove_if(witnessInfo.witnessSelectionPoolFiltered.begin(), witnessInfo.witnessSelectionPoolFiltered.end(), [&](RouletteItem& x){ CTxOutPoW2Witness details; GetPow2WitnessOutput(x.coin.out, details); return !(details.lockUntilBlock - nMinAge >= nBlockHeight); }), witnessInfo.witnessSelectionPoolFiltered.end());
-        //LogPrint(BCLog::WITNESS, "Witness pool size3a: %d minage: %d\n", witnessInfo.witnessSelectionPoolFiltered.size(), nMinAge);
-
-        // We must have at least 100 accounts to keep odds of being selected down below 1% at all times.
-        if (witnessInfo.witnessSelectionPoolFiltered.size() < 100)
-        {
-            // fixme: (2.0) Add warning/logging for this.
-            // NB!! This part of the code should (ideally) never actually be used, it exists only for instances where their are a shortage of witnesses paticipating on the network.
-            // Hard limit - we never allow a min age lower than 2 as this starts to cause code issues.
-            if (nMinAge == 0 || (nMinAge <= 10 && witnessInfo.witnessSelectionPoolFiltered.size() > 5))
-            {
-                break;
-            }
-            else
-            {
-                // Try again to reach 100 candidates with a smaller min age.
-                nMinAge -= 5;
-            }
-        }
-        else
-        {
-            break;
-        }
-    }
-
-    if (witnessInfo.witnessSelectionPoolFiltered.size() == 0)
-    {
-        return error("Unable to determine any witnesses for block.");
-    }
-
-    /** Ensure the pool is sorted deterministically **/
-    std::sort(witnessInfo.witnessSelectionPoolFiltered.begin(), witnessInfo.witnessSelectionPoolFiltered.end());
-
-    /** Reduce larger weightings to a maximum weighting of 1% of network weight. **/
-    /** NB!! this actually will end up a little bit more than 1% as the overall network weight will also be reduced as a result. **/
-    /** This is however unimportant as 1% is in and of itself also somewhat arbitrary, simpler code is favoured here over exactness. **/
-    /** So we delibritely make no attempt to compensate for this. **/
-    uint64_t maxWeight = witnessInfo.nTotalWeight / 100;
-    witnessInfo.nReducedTotalWeight = 0;
-    for (auto& item : witnessInfo.witnessSelectionPoolFiltered)
-    {
-        if (item.nWeight > maxWeight)
-            item.nWeight = maxWeight;
-        witnessInfo.nReducedTotalWeight += item.nWeight;
-        item.nCumulativeWeight = witnessInfo.nReducedTotalWeight;
-    }
-
-    /** sha256 as random roulette spin/seed - NB! We deliritely use sha256 and -not- the normal PoW hash here as the normal PoW hash is biased towards certain number ranges by -design- (block target) so is not a good RNG... **/
-    arith_uint256 rouletteSelectionSeed = UintToArith256(blockHash);
-
-    //checkme: (GULDEN) (2.0) (POW2) - Is this necessary? I don't think so, so disabling.
-    /** ensure random seed exceeds one full spin of the wheel to prevent any possible bias towards low numbers **/
-    //while (rouletteSelectionSeed < witnessInfo.nReducedTotalWeight)
-    //{
-        //rouletteSelectionSeed = rouletteSelectionSeed * 2;
-    //}
-
-    //LogPrint(BCLog::WITNESS, "RNG1 %d %d\n", rouletteSelectionSeed.GetLow64(), witnessInfo.nReducedTotalWeight);
-    if (rouletteSelectionSeed > arith_uint256(witnessInfo.nReducedTotalWeight))
-    {
-        // 'BigNum' Modulo operator via mathematical identity:  a % b = a - (b * int(a/b))
-        rouletteSelectionSeed = rouletteSelectionSeed - (arith_uint256(witnessInfo.nReducedTotalWeight) * arith_uint256(rouletteSelectionSeed/arith_uint256(witnessInfo.nReducedTotalWeight)));
-    }
-    //LogPrint(BCLog::WITNESS, "RNG2 %d %d\n", rouletteSelectionSeed.GetLow64(), witnessInfo.nReducedTotalWeight);
-
-    auto selectedWitness = std::lower_bound(witnessInfo.witnessSelectionPoolFiltered.begin(), witnessInfo.witnessSelectionPoolFiltered.end(), rouletteSelectionSeed.GetLow64());
-    //LogPrint(BCLog::WITNESS, "Selected witness age %d\n", selectedWitness->nAge);
-    witnessInfo.selectedWitnessTransaction = selectedWitness->coin.out;
-    witnessInfo.selectedWitnessBlockHeight = selectedWitness->coin.nHeight;
-    witnessInfo.selectedWitnessOutpoint = selectedWitness->outpoint;
-
-    //LogPrintf(">>>Selected witness=%s %s fromblockhash=%s fromblockheight=%d currentheight=%d prevout=%s \n",selectedWitness->coin.out.output.GetHex(selectedWitness->coin.out.GetType()), selectedWitness->coin.out.ToString(), block.GetHashPoW2().ToString(), resultBlockHeight, nBlockHeight, resultOutPoint.hash.ToString());
-    return true;
-}
-
-bool GetWitnessInfo(CChain& chain, const CChainParams& chainParams, CCoinsViewCache* viewOverride, CBlockIndex* pPreviousIndexChain, CBlock block, CGetWitnessInfo& witnessInfo, uint64_t nBlockHeight)
-{
-    LOCK2(cs_main, pactiveWallet?&pactiveWallet->cs_wallet:nullptr);
-
-    // Fetch all unspent witness outputs for the chain in which -block- acts as the tip.
-    if (!getAllUnspentWitnessCoins(chain, chainParams, pPreviousIndexChain, witnessInfo.allWitnessCoins, &block, viewOverride))
-        return false;
-
-    // Calculate network weight based on current block, exclude witnesses that are too old.
-    for (auto coinIter : witnessInfo.allWitnessCoins)
-    {
-        //testme: (GULDEN) (POW2) (2.0) (HIGH) - Make sure no off by 1 error here.
-        uint64_t nAge = nBlockHeight - coinIter.second.nHeight;
-        COutPoint outPoint = coinIter.first;
-        Coin coin = coinIter.second;
-        if (coin.out.nValue >= nMinimumWitnessAmount)
-        {
-            uint64_t nUnused1, nUnused2;
-            int64_t nWeight = GetPoW2RawWeightForAmount(coin.out.nValue, GetPoW2LockLengthInBlocksFromOutput(coin.out, coin.nHeight, nUnused1, nUnused2));
-            if (nWeight < nMinimumWitnessWeight)
-                continue;
-            witnessInfo.witnessSelectionPoolUnfiltered.push_back(RouletteItem(outPoint, coin, nWeight, nAge));
-            witnessInfo.nTotalWeight += nWeight;
-        }
-    }
-    return true;
-}
-
-bool GetWitness(CChain& chain, const CChainParams& chainParams, CCoinsViewCache* viewOverride, CBlockIndex* pPreviousIndexChain, CBlock block, CGetWitnessInfo& witnessInfo)
-{
-    LOCK2(cs_main, pactiveWallet?&pactiveWallet->cs_wallet:nullptr);
-
-    // Fetch all the chain info (for specific block) we will need to calculate the witness.
-    uint64_t nBlockHeight = pPreviousIndexChain->nHeight + 1;
-    if (!GetWitnessInfo(chain, chainParams, viewOverride, pPreviousIndexChain, block, witnessInfo, nBlockHeight))
-        return false;
-
-    return GetWitnessHelper(chain, chainParams, viewOverride, pPreviousIndexChain, block.GetHashLegacy(), witnessInfo, nBlockHeight);
-}
-
-//fixme: (2.0) (HIGH) - switch to a hybrid of witInfo.nTotalWeight / witInfo.nReducedTotalWeight - as both independantly aren't perfect.
-// total weight is prone to be too high if there are lots of large >1% witnesses, nReducedTotalWeight is prone to be too low if there is one large witness who has recently witnessed.
-bool witnessHasExpired(uint64_t nWitnessAge, uint64_t nWitnessWeight, uint64_t nNetworkTotalWitnessWeight)
-{
-    uint64_t nExpectedWitnessPeriod = expectedWitnessBlockPeriod(nWitnessWeight, nNetworkTotalWitnessWeight);
-    return ( nWitnessAge > nMaximumParticipationAge ) || ( nWitnessAge > nExpectedWitnessPeriod );
 }
 
 
@@ -3684,10 +2477,7 @@ std::vector<unsigned char> GenerateCoinbaseCommitment(CBlock& block, const CBloc
 
 
 
-/** Context-dependent validity checks.
- *  By "context", we mean only the previous block headers, but not the UTXO
- *  set; UTXO-related validity checks are done in ConnectBlock(). */
-static bool ContextualCheckBlockHeader(const CBlockHeader& block, CValidationState& state, const Consensus::Params& consensusParams, const CBlockIndex* pindexPrev, int64_t nAdjustedTime)
+bool ContextualCheckBlockHeader(const CBlockHeader& block, CValidationState& state, const Consensus::Params& consensusParams, const CBlockIndex* pindexPrev, int64_t nAdjustedTime)
 {
     assert(pindexPrev != NULL);
     //const int nHeight = pindexPrev->nHeight + 1;
@@ -3729,7 +2519,7 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, CValidationSta
 //fixme: (2.1) Do away with this doUTXOChecks junk
 //Long story short; we need to call this twice, the second time from within ConnectTip as we can't do the 'phase' checks without the utxo
 //After 2.1 we won't need the phase checks so we can code this properly.
-static bool ContextualCheckBlock(const CBlock& block, CValidationState& state, const CChainParams& chainParams, const CBlockIndex* pindexPrev, CChain& chainOverride, CCoinsViewCache* viewOverride, bool doUTXOChecks)
+bool ContextualCheckBlock(const CBlock& block, CValidationState& state, const CChainParams& chainParams, const CBlockIndex* pindexPrev, CChain& chainOverride, CCoinsViewCache* viewOverride, bool doUTXOChecks)
 {
     const int nHeight = pindexPrev == NULL ? 0 : pindexPrev->nHeight + 1;
 
@@ -3987,166 +2777,6 @@ bool ProcessNewBlockHeaders(const std::vector<CBlockHeader>& headers, CValidatio
     return true;
 }
 
-bool ExtractWitnessBlockFromWitnessCoinbase(CChain& chain, int nWitnessCoinbaseIndex, const CBlockIndex* pindexPrev, const CBlock& block, const CChainParams& chainParams, CCoinsViewCache& view, CBlock& embeddedWitnessBlock)
-{
-    AssertLockHeld(cs_main); // Required for ReadBlockFromDisk.
-
-    if (nWitnessCoinbaseIndex == -1)
-        return error("Invalid coinbase index for embedded witness coinbase info.");
-    if (block.vtx.size() < 2)
-        return error("Missing transactions for witness coinbase index, must be at least two transactions.");
-    if (block.vtx[1]->vout.size() != 2)
-        return error("Missing outputs for witness coinbase index, must be exactly two outputs.");
-    if (block.vtx[1]->vin.size() != 1)
-        return error("Missing input for witness coinbase index, must be exactly one input.");
-    if (!IsPow2WitnessOutput(block.vtx[1]->vout[0]))
-        return error("Invalid transaction type for first witness coinbase output, must be a witness address/output.");
-    if (IsPow2WitnessOutput(block.vtx[1]->vout[1]))
-        return error("Invalid transaction type for second witness coinbase output, must not be a witness address/output.");
-
-    CScript expect = CScript() << OP_RETURN << pindexPrev->nHeight + 1;
-    if (block.vtx[1]->vout[1].output.scriptPubKey.size() < expect.size() || !std::equal(expect.begin(), expect.end(), block.vtx[1]->vout[1].output.scriptPubKey.begin()))
-    {
-        return error("Invalid scriptSig for embedded witness coinbase info.");
-    }
-
-    //'identifier' already checked in GetPoW2WitnessCoinbaseIndex - so just skip past it.
-    std::vector<unsigned char> serialisedWitnessHeaderInfo = std::vector<unsigned char>(block.vtx[0]->vout[nWitnessCoinbaseIndex].output.scriptPubKey.begin() + 6, block.vtx[0]->vout[nWitnessCoinbaseIndex].output.scriptPubKey.end());
-    CDataStream serialisedWitnessHeaderInfoStream(serialisedWitnessHeaderInfo, SER_NETWORK, INIT_PROTO_VERSION);
-
-    uint256 hashPrevPoWIndex;
-
-    // Reconstruct header information of previous witness block from the coinbase of this PoW block.
-    if (!ReadBlockFromDisk(embeddedWitnessBlock, pindexPrev, chainParams.GetConsensus()))
-        return false;
-
-    embeddedWitnessBlock.witnessHeaderPoW2Sig.resize(65);
-    ::Unserialize(serialisedWitnessHeaderInfoStream, embeddedWitnessBlock.nVersionPoW2Witness);
-    ::Unserialize(serialisedWitnessHeaderInfoStream, embeddedWitnessBlock.nTimePoW2Witness);
-    ::Unserialize(serialisedWitnessHeaderInfoStream, embeddedWitnessBlock.hashMerkleRootPoW2Witness);
-    ::Unserialize(serialisedWitnessHeaderInfoStream, NOSIZEVECTOR(embeddedWitnessBlock.witnessHeaderPoW2Sig));
-    ::Unserialize(serialisedWitnessHeaderInfoStream, hashPrevPoWIndex);
-
-    // Check prev hash
-    if (hashPrevPoWIndex != pindexPrev->GetBlockHashLegacy())
-        return error("Embedded witness coinbase info contains mismatched prevHash.");
-
-    // Check for valid signature size
-    if (embeddedWitnessBlock.witnessHeaderPoW2Sig.size() != 65)
-        return error("Embedded witness coinbase info contains invalid signature size.");
-
-    // Check that block is a witness block
-    if (embeddedWitnessBlock.nVersionPoW2Witness == 0)
-        return error("Embedded witness coinbase info contains invalid witness version.");
-
-    // Reconstruct transaction information of previous witness block from the coinbase of this PoW block.
-    CMutableTransaction coinbaseTx(CTransaction::CURRENT_VERSION);
-    coinbaseTx.vin.resize(2);
-    coinbaseTx.vout.resize(2);
-    coinbaseTx.vout[0] = block.vtx[1]->vout[0];
-    coinbaseTx.vout[1].output.scriptPubKey = block.vtx[0]->vout[nWitnessCoinbaseIndex+1].output.scriptPubKey;
-    coinbaseTx.vout[1].nValue = block.vtx[0]->vout[nWitnessCoinbaseIndex+1].nValue;
-    coinbaseTx.vin[0].prevout.SetNull();
-    coinbaseTx.vin[0].SetSequence(0, coinbaseTx.nVersion, CTxInFlags::None) ;
-    coinbaseTx.vin[0].scriptSig = CScript() << pindexPrev->nHeight;
-    coinbaseTx.vin[1] = block.vtx[1]->vin[0];
-    embeddedWitnessBlock.vtx.emplace_back(MakeTransactionRef(std::move(coinbaseTx)));
-
-    //LogPrintf(">>>[Embedded] Extract witness block from coinbase: prevheight:%d height:%d \nembedded block: %s\n", pindexPrev->nHeight, pindexPrev->nHeight+1 , embeddedWitnessBlock.ToString());
-    return true;
-}
-
-bool WitnessCoinbaseInfoIsValid(CChain& chain, int nWitnessCoinbaseIndex, const CBlockIndex* pindexPrev, const CBlock& block, const CChainParams& chainParams, CCoinsViewCache& view)
-{
-    AssertLockHeld(cs_main);
-
-    CBlock embeddedWitnessBlock;
-    if (!ExtractWitnessBlockFromWitnessCoinbase(chain, nWitnessCoinbaseIndex, pindexPrev, block, chainParams, view, embeddedWitnessBlock))
-        return error("Could not extract embedded witness information from witness coinbase.");
-
-    // Ensure that the witness signature itself is actually valid.
-    bool ret = true;
-    if (ret)
-    {
-        CBlockIndex* pPreviousIndexChain = nullptr;
-        CCloneChain tempChain = chain.Clone(pindexPrev->pprev, pPreviousIndexChain);
-        CValidationState state;
-        CCoinsViewCache viewNew(&view);
-
-        CPubKey pubkey;
-        uint256 hash = embeddedWitnessBlock.GetHashPoW2();
-        if (!pubkey.RecoverCompact(hash, embeddedWitnessBlock.witnessHeaderPoW2Sig))
-            ret = error("Could not recover public key from embedded witness coinbase header");
-        //LogPrintf(">>>[Embedded] witness pubkey [%s]\n", pubkey.GetID().GetHex());
-
-        // Phase 3 restriction - we force the miners nVersion to reflect the version the witness of the block before had - thus allowing control of voting for phase 4 to be controlled by witnesses.
-        if (ret && block.nVersion != embeddedWitnessBlock.nVersionPoW2Witness)
-            ret = error("Embedded witness version doesn't match version of parent PoW block.");
-
-        if (ret)
-        {
-            CGetWitnessInfo witInfo;
-            if (!GetWitness(tempChain, chainParams, &viewNew, pPreviousIndexChain, embeddedWitnessBlock, witInfo))
-            {
-                ret = error("Could not determine a valid witness for embedded witness coinbase header");
-            }
-            else
-            {
-                if (witInfo.selectedWitnessTransaction.GetType() <= CTxOutType::ScriptLegacyOutput)
-                {
-                    if (CKeyID(uint160(witInfo.selectedWitnessTransaction.output.scriptPubKey.GetPow2WitnessHash())) != pubkey.GetID())
-                        ret = error("Mismatched witness signature for embedded witness coinbase header");
-                }
-                else
-                {
-                    ret = error("Invalid transaction type for embedded witness coinbase header");
-                }
-            }
-        }
-
-        if (!ret)
-        {
-            LogPrintf("%s\n", embeddedWitnessBlock.ToString());
-            return false;
-        }
-    }
-
-    // Now test that the reconstructed witness block is valid, if it is then the 'witness coinbase info' of this PoW block is valid.
-    // fixme: (2.1) SBSU - We really don't need to clone the entire chain here, could we clone just the last 1000 or something?
-    // We work on a clone of the chain to prevent modifying the actual chain.
-    {
-        CBlockIndex* pPreviousIndexChain = nullptr;
-        CCloneChain tempChain = chain.Clone(pindexPrev->pprev, pPreviousIndexChain);
-        CValidationState state;
-        CCoinsViewCache viewNew(&view);
-        // Force the tip of the chain to the block that comes before the block we are examining.
-        ForceActivateChain(pPreviousIndexChain, nullptr, state, chainParams, tempChain, viewNew);
-
-        CValidationState witnessValidationState;
-        assert(pPreviousIndexChain && pPreviousIndexChain == tempChain.Tip());
-
-        CBlockIndex indexDummy(embeddedWitnessBlock);
-        indexDummy.pprev = pPreviousIndexChain;
-        indexDummy.nHeight = pPreviousIndexChain->nHeight + 1;
-
-        if (!ContextualCheckBlockHeader(embeddedWitnessBlock, state, chainParams.GetConsensus(), pPreviousIndexChain, GetAdjustedTime()))
-            ret = error("Failed ContextualCheckBlockHeader for embedded witness block");
-        if (!ret || !CheckBlock(embeddedWitnessBlock, state, chainParams.GetConsensus(), false, true))
-            ret = error("Failed CheckBlock for embedded witness block");
-        if (!ret || !ContextualCheckBlock(embeddedWitnessBlock, state, chainParams, pPreviousIndexChain, tempChain, &viewNew))
-            ret = error("Failed ContextualCheckBlock for embedded witness block");
-        if (!ret || !ConnectBlock(tempChain, embeddedWitnessBlock, state, &indexDummy, viewNew, chainParams, true, false))
-            ret = error("Failed ConnectBlock for embedded witness block");
-        if (!state.IsValid())
-            ret = error("Invalid state after ConnectBlock for embedded witness block");
-
-        if (!ret)
-            LogPrintf("%s\n", embeddedWitnessBlock.ToString());
-    }
-
-    return ret;
-}
-
 /** Store block on disk. If dbp is non-NULL, the file is known to already reside on disk */
 static bool AcceptBlock(const std::shared_ptr<const CBlock>& pblock, CValidationState& state, const CChainParams& chainparams, CBlockIndex** ppindex, bool fRequested, const CDiskBlockPos* dbp, bool* fNewBlock, bool fAssumePOWGood = false)
 {
@@ -4345,7 +2975,7 @@ void PruneOneBlockFile(const int fileNumber)
 }
 
 /* Calculate the block/rev files to delete based on height specified by user with RPC command pruneblockchain */
-static void FindFilesToPruneManual(std::set<int>& setFilesToPrune, int nManualPruneHeight)
+void FindFilesToPruneManual(std::set<int>& setFilesToPrune, int nManualPruneHeight)
 {
     assert(fPruneMode && nManualPruneHeight > 0);
 
@@ -4389,7 +3019,7 @@ void PruneBlockFilesManual(int nManualPruneHeight)
  *
  * @param[out]   setFilesToPrune   The set of file indices that can be unlinked will be returned
  */
-static void FindFilesToPrune(std::set<int>& setFilesToPrune, uint64_t nPruneAfterHeight)
+void FindFilesToPrune(std::set<int>& setFilesToPrune, uint64_t nPruneAfterHeight)
 {
     LOCK2(cs_main, cs_LastBlockFile);
     if (chainActive.Tip() == NULL || nPruneTarget == 0) {
@@ -5324,138 +3954,7 @@ int VersionBitsTipStateSinceHeight(const Consensus::Params& params, Consensus::D
     return VersionBitsStateSinceHeight(chainActive.Tip(), params, pos, versionbitscache);
 }
 
-static const uint64_t MEMPOOL_DUMP_VERSION = 1;
 
-bool LoadMempool(void)
-{
-    const CChainParams& chainparams = Params();
-    int64_t nExpiryTimeout = GetArg("-mempoolexpiry", DEFAULT_MEMPOOL_EXPIRY) * 60 * 60;
-    FILE* filestr = fsbridge::fopen(GetDataDir() / "mempool.dat", "rb");
-    CAutoFile file(filestr, SER_DISK, CLIENT_VERSION);
-    if (file.IsNull()) {
-        LogPrintf("Failed to open mempool file from disk. Continuing anyway.\n");
-        return false;
-    }
-
-    int64_t count = 0;
-    int64_t skipped = 0;
-    int64_t failed = 0;
-    int64_t nNow = GetTime();
-
-    try {
-        uint64_t version;
-        file >> version;
-        if (version != MEMPOOL_DUMP_VERSION) {
-            return false;
-        }
-        uint64_t num;
-        file >> num;
-        while (num--) {
-            CTransactionRef tx;
-            int64_t nTime;
-            int64_t nFeeDelta;
-            file >> tx;
-            file >> nTime;
-            file >> nFeeDelta;
-
-            CAmount amountdelta = nFeeDelta;
-            if (amountdelta) {
-                mempool.PrioritiseTransaction(tx->GetHash(), amountdelta);
-            }
-            CValidationState state;
-            if (nTime + nExpiryTimeout > nNow) {
-                LOCK(cs_main);
-                AcceptToMemoryPoolWithTime(chainparams, mempool, state, tx, true, NULL, nTime, NULL, false, 0);
-                if (state.IsValid()) {
-                    ++count;
-                } else {
-                    ++failed;
-                }
-            } else {
-                ++skipped;
-            }
-            if (ShutdownRequested())
-                return false;
-        }
-        std::map<uint256, CAmount> mapDeltas;
-        file >> mapDeltas;
-
-        for (const auto& i : mapDeltas) {
-            mempool.PrioritiseTransaction(i.first, i.second);
-        }
-    } catch (const std::exception& e) {
-        LogPrintf("Failed to deserialize mempool data on disk: %s. Continuing anyway.\n", e.what());
-        return false;
-    }
-
-    LogPrintf("Imported mempool transactions from disk: %i successes, %i failed, %i expired\n", count, failed, skipped);
-    return true;
-}
-
-void DumpMempool(void)
-{
-    int64_t start = GetTimeMicros();
-
-    std::map<uint256, CAmount> mapDeltas;
-    std::vector<TxMempoolInfo> vinfo;
-
-    {
-        LOCK(mempool.cs);
-        for (const auto &i : mempool.mapDeltas) {
-            mapDeltas[i.first] = i.second;
-        }
-        vinfo = mempool.infoAll();
-    }
-
-    int64_t mid = GetTimeMicros();
-
-    try {
-        FILE* filestr = fsbridge::fopen(GetDataDir() / "mempool.dat.new", "wb");
-        if (!filestr) {
-            return;
-        }
-
-        CAutoFile file(filestr, SER_DISK, CLIENT_VERSION);
-
-        uint64_t version = MEMPOOL_DUMP_VERSION;
-        file << version;
-
-        file << (uint64_t)vinfo.size();
-        for (const auto& i : vinfo) {
-            file << *(i.tx);
-            file << (int64_t)i.nTime;
-            file << (int64_t)i.nFeeDelta;
-            mapDeltas.erase(i.tx->GetHash());
-        }
-
-        file << mapDeltas;
-        FileCommit(file.Get());
-        file.fclose();
-        RenameOver(GetDataDir() / "mempool.dat.new", GetDataDir() / "mempool.dat");
-        int64_t last = GetTimeMicros();
-        LogPrintf("Dumped mempool: %gs to copy, %gs to dump\n", (mid-start)*0.000001, (last-mid)*0.000001);
-    } catch (const std::exception& e) {
-        LogPrintf("Failed to dump mempool: %s. Continuing anyway.\n", e.what());
-    }
-}
-
-//! Guess how far we are in the verification process at the given block index
-double GuessVerificationProgress(const ChainTxData& data, CBlockIndex *pindex) {
-    if (pindex == NULL)
-        return 0.0;
-
-    int64_t nNow = time(NULL);
-
-    double fTxTotal;
-
-    if (pindex->nChainTx <= data.nTxCount) {
-        fTxTotal = data.nTxCount + (nNow - data.nTime) * data.dTxRate;
-    } else {
-        fTxTotal = pindex->nChainTx + (nNow - pindex->GetBlockTime()) * data.dTxRate;
-    }
-
-    return pindex->nChainTx / fTxTotal;
-}
 
 class CMainCleanup
 {

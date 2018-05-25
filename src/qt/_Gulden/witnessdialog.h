@@ -11,9 +11,10 @@
 
 
 #include <QFrame>
+#include <QDateTime>
 
 class QMenu;
-class PlatformStyle;
+class QStyle;
 class QwtPlotCurve;
 class ClientModel;
 class OptionsModel;
@@ -43,7 +44,7 @@ class WitnessDialog : public QFrame
     Q_OBJECT
 
 public:
-    explicit WitnessDialog(const PlatformStyle *platformStyle, QWidget *parent = 0);
+    explicit WitnessDialog(const QStyle *platformStyle, QWidget *parent = 0);
     ~WitnessDialog();
 
     void setClientModel(ClientModel *clientModel);
@@ -58,6 +59,7 @@ public Q_SLOTS:
     void updateUnit(int nNewUnit_);
     void plotGraphForAccount(CAccount* account, uint64_t nTotalNetworkWeightTip);
     void update();
+    void numBlocksChanged(int,QDateTime,double,bool);
     void unitButtonClicked();
     void viewWitnessInfoClicked();
     void emptyWitnessClicked();
@@ -67,7 +69,7 @@ protected:
 
 private:
     Ui::WitnessDialog *ui;
-    const PlatformStyle *platformStyle;
+    const QStyle *platformStyle;
     ClientModel *clientModel;
     WalletModel *model;
 
@@ -83,6 +85,9 @@ private:
 
 private Q_SLOTS:
 
+Q_SIGNALS:
+    // Sent when a message should be reported to the user.
+    void message(const QString &title, const QString &message, unsigned int style);
 };
 
 #endif // GULDEN_QT_WITNESSDIALOG_H

@@ -2,7 +2,7 @@
 name: "Gulden-osx-0.15"
 enable_cache: true
 suites:
-- "trusty"
+- "bionic"
 architectures:
 - "amd64"
 packages:
@@ -10,7 +10,7 @@ packages:
 - "ca-certificates"
 - "curl"
 - "g++"
-- "git-core"
+- "git"
 - "pkg-config"
 - "autoconf"
 - "librsvg2-bin"
@@ -34,7 +34,7 @@ packages:
 - "flex"
 - "genisoimage"
 remotes:
-- "url": "https://github.com/Gulden/gulden-dev.git"
+- "url": https://github.com/Gulden/gulden-official.git
   "dir": "Gulden"
 files:
 - "MacOSX10.11.sdk.tar.gz"

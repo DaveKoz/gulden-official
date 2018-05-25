@@ -19,7 +19,6 @@
 #include "bantablemodel.h"
 #include "clientmodel.h"
 #include "guiutil.h"
-#include "platformstyle.h"
 #include "chainparams.h"
 #include "netbase.h"
 #include "rpc/server.h"
@@ -404,7 +403,7 @@ void RPCExecutor::request(const QString &command)
     }
 }
 
-RPCConsole::RPCConsole(const PlatformStyle *_platformStyle, QWidget *parent) :
+RPCConsole::RPCConsole(const QStyle *_platformStyle, QWidget *parent) :
     QWidget(parent),
     ui(new Ui::RPCConsole),
     clientModel(0),
@@ -419,12 +418,22 @@ RPCConsole::RPCConsole(const PlatformStyle *_platformStyle, QWidget *parent) :
 
     ui->openDebugLogfileButton->setToolTip(ui->openDebugLogfileButton->toolTip().arg(tr(PACKAGE_NAME)));
 
-    if (platformStyle->getImagesOnButtons()) {
-        ui->openDebugLogfileButton->setIcon(platformStyle->SingleColorIcon(":/icons/export"));
+    if (GUIUtil::showImagesOnButtons())
+    {
+        ui->openDebugLogfileButton->setTextFormat( Qt::RichText );
+        ui->openDebugLogfileButton->setText(GUIUtil::fontAwesomeRegular("\uf064") + " " + ui->openDebugLogfileButton->text());
     }
+
+    ui->clearButton->setTextFormat( Qt::RichText );
     ui->clearButton->setText( GUIUtil::fontAwesomeRegular("\uf057") );
     ui->fontBiggerButton->setText( GUIUtil::fontAwesomeRegular("\uf00e") );
+    ui->fontBiggerButton->setTextFormat( Qt::RichText );
     ui->fontSmallerButton->setText( GUIUtil::fontAwesomeRegular("\uf010") );
+    ui->fontSmallerButton->setTextFormat( Qt::RichText );
+
+    ui->clearButton->setCursor( Qt::PointingHandCursor );
+    ui->fontBiggerButton->setCursor( Qt::PointingHandCursor );
+    ui->fontSmallerButton->setCursor( Qt::PointingHandCursor );
 
     // Install event filter for up and down arrow
     ui->lineEdit->installEventFilter(this);
@@ -433,6 +442,7 @@ RPCConsole::RPCConsole(const PlatformStyle *_platformStyle, QWidget *parent) :
     connect(ui->clearButton, SIGNAL(clicked()), this, SLOT(clear()));
     connect(ui->fontBiggerButton, SIGNAL(clicked()), this, SLOT(fontBigger()));
     connect(ui->fontSmallerButton, SIGNAL(clicked()), this, SLOT(fontSmaller()));
+    connect(ui->openDebugLogfileButton, SIGNAL(clicked()), this, SLOT(on_openDebugLogfileButton_clicked()));
     connect(ui->btnClearTrafficGraph, SIGNAL(clicked()), ui->trafficGraph, SLOT(clear()));
 
     // set library version labels
@@ -546,10 +556,15 @@ void RPCConsole::setClientModel(ClientModel *model)
 
         // create peer table context menu actions
         QAction* disconnectAction = new QAction(tr("&Disconnect"), this);
+        disconnectAction->setObjectName("action_rpc_peer_disconnect");
         QAction* banAction1h      = new QAction(tr("Ban for") + " " + tr("1 &hour"), this);
+        banAction1h->setObjectName("action_rpc_ban_1h");
         QAction* banAction24h     = new QAction(tr("Ban for") + " " + tr("1 &day"), this);
+        banAction24h->setObjectName("action_rpc_ban_24h");
         QAction* banAction7d      = new QAction(tr("Ban for") + " " + tr("1 &week"), this);
+        banAction7d->setObjectName("action_rpc_ban_7d");
         QAction* banAction365d    = new QAction(tr("Ban for") + " " + tr("1 &year"), this);
+        banAction365d->setObjectName("action_rpc_ban_365d");
 
         // create peer table context menu
         peersTableContextMenu = new QMenu(this);
@@ -598,9 +613,11 @@ void RPCConsole::setClientModel(ClientModel *model)
 
         // create ban table context menu action
         QAction* unbanAction = new QAction(tr("&Unban"), this);
+        unbanAction->setObjectName("action_rpc_unban");
 
         // create ban table context menu
         banTableContextMenu = new QMenu(this);
+        banTableContextMenu->setObjectName("menu_rpc_ban_context");
         banTableContextMenu->addAction(unbanAction);
 
         // ban table context menu signals
@@ -1194,7 +1211,8 @@ void RPCConsole::unbanSelectedNode()
 
 void RPCConsole::clearSelectedNode()
 {
-    ui->peerWidget->selectionModel()->clearSelection();
+    if (ui->peerWidget)
+        ui->peerWidget->selectionModel()->clearSelection();
     cachedNodeids.clear();
     ui->detailWidget->hide();
     ui->peerHeading->setText(tr("Select a peer to view detailed information."));

@@ -33,6 +33,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "consensus/tx_verify.h"
+#include "txmempool.h"
 
 #include <atomic>
 
@@ -56,6 +58,13 @@ struct PrecomputedTransactionData;
 struct LockPoints;
 
 class CWitViewDB;
+
+enum FlushStateMode {
+    FLUSH_STATE_NONE,
+    FLUSH_STATE_IF_NEEDED,
+    FLUSH_STATE_PERIODIC,
+    FLUSH_STATE_ALWAYS
+};
 
 /** Default for accepting alerts from the P2P network. */
 static const bool DEFAULT_ALERTS = true;
@@ -135,10 +144,10 @@ static const unsigned int INVENTORY_BROADCAST_MAX = 7 * INVENTORY_BROADCAST_INTE
 static const unsigned int AVG_FEEFILTER_BROADCAST_INTERVAL = 10 * 60;
 /** Maximum feefilter broadcast delay after significant change. */
 static const unsigned int MAX_FEEFILTER_CHANGE_DELAY = 5 * 60;
-/** Block download timeout base, expressed in millionths of the block interval (i.e. 10 min) */
-static const int64_t BLOCK_DOWNLOAD_TIMEOUT_BASE = 1000000;
-/** Additional block download timeout per parallel downloading peer (i.e. 5 min) */
-static const int64_t BLOCK_DOWNLOAD_TIMEOUT_PER_PEER = 500000;
+/** Block download timeout base, expressed in microseconds */
+static const int64_t BLOCK_DOWNLOAD_TIMEOUT_BASE = 10000000;
+/** Additional block download timeout per parallel downloading peer, expressed in microseconds*/
+static const int64_t BLOCK_DOWNLOAD_TIMEOUT_PER_PEER = 5000000;
 
 static const int64_t DEFAULT_MAX_TIP_AGE = 24 * 60 * 60;
 /** Maximum age of our tip in seconds for us to be considered current for fee estimation */
@@ -298,7 +307,6 @@ bool GetTransaction(const uint256 &hash, CTransactionRef &tx, const Consensus::P
 /** Find the best known block, and make it the tip of the block chain */
 bool ActivateBestChain(CValidationState& state, const CChainParams& chainparams, std::shared_ptr<const CBlock> pblock = std::shared_ptr<const CBlock>());
 CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams);
-CAmount GetBlockSubsidyWitness(int nHeight, const Consensus::Params& consensusParams);
 
 /** Guess verification progress (as a fraction between 0.0=genesis and 1.0=current tip). */
 double GuessVerificationProgress(const ChainTxData& data, CBlockIndex* pindex);
@@ -461,69 +469,83 @@ extern CCoinsViewCache *pcoinsTip;
 /** Global variable that points to the active block tree (protected by cs_main) */
 extern CBlockTreeDB *pblocktree;
 
+struct CBlockIndexWorkComparator
+{
+    bool operator()(CBlockIndex *pa, CBlockIndex *pb) const {
+        // First sort by most total work, ...
+        if (pa->nChainWork > pb->nChainWork) return false;
+        if (pa->nChainWork < pb->nChainWork) return true;
 
-/** Global variable that points to the witness coins database (protected by cs_main) */
-extern CWitViewDB *ppow2witdbview;
-extern std::shared_ptr<CCoinsViewCache> ppow2witTip;
+        // (Phase 3) PoW blocks at same height as witness blocks - always make the PoW blocks rank higher.
+        if (pa->nHeight == pb->nHeight)
+        {
+            if (pa->nVersionPoW2Witness == 0 && pb->nVersionPoW2Witness != 0)
+            {
+                return false;
+            }
+            if (pa->nVersionPoW2Witness != 0 && pb->nVersionPoW2Witness == 0)
+            {
+                return true;
+            }
+        }
 
-// Returns all competing orphans at same height and same parent as current tip.
-// NB! It is important that we consider height and not chain weight here.
-// If there is a stalled chain due to absentee signer(s) delta may drop the difficulty so competing PoW blocks will have a lower chain weight, but we still want to sign them to get the chain moving again.
-std::vector<CBlockIndex*> GetTopLevelPoWOrphans(const int64_t nHeight, const uint256& prevhash);
-std::vector<CBlockIndex*> GetTopLevelWitnessOrphans(const int64_t nHeight);
-// Retrieve the witness for a PoW block (phase 3 only)
-CBlockIndex* GetWitnessOrphanForBlock(const int64_t nHeight, const uint256& prevHash, const uint256& powHash);
+        // ... then by earliest time received, ...
+        if (pa->nSequenceId < pb->nSequenceId) return false;
+        if (pa->nSequenceId > pb->nSequenceId) return true;
 
-bool ForceActivateChain(CBlockIndex* pActivateIndex, std::shared_ptr<const CBlock> pblock, CValidationState& state, const CChainParams& chainparams, CChain& currentChain, CCoinsViewCache& coinView);
-bool ForceActivateChainWithBlockAsTip(CBlockIndex* pActivateIndex, std::shared_ptr<const CBlock> pblock, CValidationState& state, const CChainParams& chainparams, CChain& currentChain, CCoinsViewCache& coinView, CBlockIndex* pnewblockastip);
-int GetPoW2WitnessCoinbaseIndex(const CBlock& block);
-bool ExtractWitnessBlockFromWitnessCoinbase(CChain& chain, int nWitnessCoinbaseIndex, const CBlockIndex* pindexPrev, const CBlock& block, const CChainParams& chainParams, CCoinsViewCache& view, CBlock& embeddedWitnessBlock);
-bool WitnessCoinbaseInfoIsValid(CChain& chain, int nWitnessCoinbaseIndex, const CBlockIndex* pindexPrev, const CBlock& block, const CChainParams& chainParams, CCoinsViewCache& view);
-bool getAllUnspentWitnessCoins(CChain& chain, const CChainParams& chainParams, const CBlockIndex* pPreviousIndexChain, std::map<COutPoint, Coin>& allWitnessCoins, CBlock* newBlock=nullptr, CCoinsViewCache* viewOverride=nullptr);
+        // Use pointer address as tie breaker (should only happen with blocks
+        // loaded from disk, as those all have id 0).
+        if (pa < pb) return false;
+        if (pa > pb) return true;
+
+        // Identical blocks.
+        return false;
+    }
+};
+
+//fixme: (2.1) (Refactoring) Move DisconnectBlock/ConnectBlock/setBlockIndexCandidates/ContextualCheckBlockHeader/ContextualCheckBlock/CheckInputs/FlushStateToDisk/FindFilesToPruneManual/FindFilesToPrune/UpdateMempoolForReorg out of header files they should be source file only - this will require moving all the chain connect/disconnect/forceactivate stuff into their own shared source file
+//validation.cpp is too large and needs to shrink.
+
+void UpdateMempoolForReorg(DisconnectedBlockTransactions &disconnectpool, bool fAddToMempool);
+
+// See definition for documentation
+bool FlushStateToDisk(const CChainParams& chainParams, CValidationState &state, FlushStateMode mode, int nManualPruneHeight=0);
+void FindFilesToPruneManual(std::set<int>& setFilesToPrune, int nManualPruneHeight);
+void FindFilesToPrune(std::set<int>& setFilesToPrune, uint64_t nPruneAfterHeight);
+
+bool CheckInputs(const CTransaction& tx, CValidationState &state, const CCoinsViewCache &inputs, bool fScriptChecks, unsigned int flags, bool cacheStore, PrecomputedTransactionData& txdata, std::vector<CWitnessTxBundle>* pWitnessBundles, std::vector<CScriptCheck> *pvChecks = NULL);
+
+/**
+ * The set of all CBlockIndex entries with BLOCK_VALID_TRANSACTIONS (for itself and all ancestors) and
+ * as good as our current tip or better. Entries may be failed, though, and pruning nodes may be
+ * missing the data for the block.
+ */
+extern std::set<CBlockIndex*, CBlockIndexWorkComparator> setBlockIndexCandidates;
+
+enum DisconnectResult
+{
+    DISCONNECT_OK,      // All good.
+    DISCONNECT_UNCLEAN, // Rolled back, but UTXO set was inconsistent with block.
+    DISCONNECT_FAILED   // Something else went wrong.
+};
+
+/** Undo the effects of this block (with given index) on the UTXO set represented by coins.
+ *  When UNCLEAN or FAILED is returned, view is left in an indeterminate state. */
+DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view);
+
+/** Apply the effects of this block (with given index) on the UTXO set represented by coins.
+ *  Validity checks that depend on the UTXO set are also done; ConnectBlock()
+ *  can fail if those validity checks fail (among other reasons). */
+bool ConnectBlock(CChain& chain, const CBlock& block, CValidationState& state, CBlockIndex* pindex, CCoinsViewCache& view, const CChainParams& chainparams, bool fJustCheck = false, bool fVerifyWitness=true);
+
+/** Context-dependent validity checks.
+ *  By "context", we mean only the previous block headers, but not the UTXO
+ *  set; UTXO-related validity checks are done in ConnectBlock(). */
+bool ContextualCheckBlockHeader(const CBlockHeader& block, CValidationState& state, const Consensus::Params& consensusParams, const CBlockIndex* pindexPrev, int64_t nAdjustedTime);
+
+bool ContextualCheckBlock(const CBlock& block, CValidationState& state, const CChainParams& chainParams, const CBlockIndex* pindexPrev, CChain& chainOverride, CCoinsViewCache* viewOverride=nullptr, bool doUTXOChecks=false);
+
 bool UpgradeBlockIndex(const CChainParams& chainparams, int nPreviousVersion, int nCurrentVersion);
-
-struct RouletteItem
-{
-public:
-    RouletteItem(const COutPoint& outpoint_, const Coin& coin_, int64_t nWeight_, int64_t nAge_) : outpoint(outpoint_), coin(coin_), nWeight(nWeight_), nAge(nAge_), nCumulativeWeight(0) {};
-    COutPoint outpoint;
-    Coin coin;
-    uint64_t nWeight;
-    uint64_t nAge;
-    uint64_t nCumulativeWeight;
-
-    friend inline bool operator<(const RouletteItem& a, const RouletteItem& b)
-    {
-        if (a.nAge == b.nAge)
-            return a.outpoint < b.outpoint;
-        return a.nAge < b.nAge;
-    }
-    friend inline bool operator<(const RouletteItem& a, const uint64_t& b)
-    {
-        return a.nCumulativeWeight < b;
-    }
-};
-struct CGetWitnessInfo
-{
-    std::map<COutPoint, Coin> allWitnessCoins;
-    std::vector<RouletteItem> witnessSelectionPoolUnfiltered;
-    std::vector<RouletteItem> witnessSelectionPoolFiltered;
-    CTxOut selectedWitnessTransaction;
-    COutPoint selectedWitnessOutpoint;
-    Coin selectedWitnessCoin;
-    uint64_t selectedWitnessBlockHeight = 0;
-
-    uint64_t nTotalWeight = 0;
-    uint64_t nReducedTotalWeight = 0;
-};
-// The period in which we are required to witness before we are forcefully removed from the pool.
-uint64_t expectedWitnessBlockPeriod(uint64_t nWeight, uint64_t networkTotalWeight);
-// The average frequency which we are expected to witness in.
-uint64_t estimatedWitnessBlockPeriod(uint64_t nWeight, uint64_t networkTotalWeight);
-bool witnessHasExpired(uint64_t nWitnessAge, uint64_t nWitnessWeight, uint64_t nNetworkTotalWitnessWeight);
-bool GetWitnessHelper(CChain& chain, const CChainParams& chainParams, CCoinsViewCache* viewOverride, CBlockIndex* pPreviousIndexChain, uint256 blockHash, CGetWitnessInfo& witnessInfo, uint64_t nBlockHeight);
-bool GetWitness(CChain& chain, const CChainParams& chainParams, CCoinsViewCache* viewOverride, CBlockIndex* pPreviousIndexChain, CBlock block, CGetWitnessInfo& witnessInfo);
-bool GetWitnessInfo(CChain& chain, const CChainParams& chainParams, CCoinsViewCache* viewOverride, CBlockIndex* pPreviousIndexChain, CBlock block, CGetWitnessInfo& witnessInfo, uint64_t nBlockHeight);
 
 /**
  * Return the spend height, which is one more than the inputs.GetBestBlock().

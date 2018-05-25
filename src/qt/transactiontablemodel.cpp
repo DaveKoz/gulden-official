@@ -13,9 +13,9 @@
 
 #include "addresstablemodel.h"
 #include "guiconstants.h"
+#include "gui.h" //For uuid variant.
 #include "guiutil.h"
 #include "optionsmodel.h"
-#include "platformstyle.h"
 #include "transactiondesc.h"
 #include "transactionrecord.h"
 #include "walletmodel.h"
@@ -262,7 +262,7 @@ public:
     }
 };
 
-TransactionTableModel::TransactionTableModel(const PlatformStyle *_platformStyle, CWallet* _wallet, WalletModel *parent):
+TransactionTableModel::TransactionTableModel(const QStyle *_platformStyle, CWallet* _wallet, WalletModel *parent):
         QAbstractTableModel(parent),
         wallet(_wallet),
         walletModel(parent),
@@ -458,6 +458,7 @@ QString TransactionTableModel::txAddressDecoration(const TransactionRecord *wtx)
         case TransactionRecord::WitnessRenew:
             return "\uf2f9";
         case TransactionRecord::SendToSelf:
+        case TransactionRecord::InternalTransfer:
             return "\uf074";
         case TransactionRecord::Other:
             return "\uf362";
@@ -772,9 +773,9 @@ QVariant TransactionTableModel::data(const QModelIndex &index, int role) const
     case AddressRole:
         return QString::fromStdString(rec->address);
     case AccountRole:
-        return QString::fromStdString(getUUIDAsString(rec->actionAccountUUID));
+        return QVariant::fromValue(rec->actionAccountUUID);
     case AccountParentRole:
-        return QString::fromStdString(getUUIDAsString(rec->actionAccountParentUUID));
+        return QVariant::fromValue(rec->actionAccountParentUUID);
     case LabelRole:
         return walletModel->getAddressTableModel()->labelForAddress(QString::fromStdString(rec->address));
     case AmountRole:

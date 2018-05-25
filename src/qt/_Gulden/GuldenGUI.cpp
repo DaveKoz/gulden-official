@@ -9,12 +9,13 @@
 
 #include "GuldenGUI.h"
 #include "gui.h"
-#include "platformstyle.h"
 #include "units.h"
 #include "clickablelabel.h"
 #include "receivecoinsdialog.h"
 #include "validation.h"
 #include "guiutil.h"
+#include "init.h"
+#include "unity/appmanager.h"
 
 #include <QAction>
 #include <QApplication>
@@ -98,53 +99,6 @@ const char* SIDE_BAR_WIDTH = "300px";
 unsigned int sideBarWidthExtended = 340;
 const char* SIDE_BAR_WIDTH_EXTENDED = "340px";
 
-GuldenProxyStyle::GuldenProxyStyle()
-: QProxyStyle("windows") //Use the same style on all platforms to simplify skinning
-{
-    altDown = false;
-}
-
-void GuldenProxyStyle::drawItemText(QPainter *painter, const QRect &rectangle, int alignment, const QPalette &palette, bool enabled, const QString &text, QPalette::ColorRole textRole) const
-{
-    // Only draw underline hints on buttons etc. if the alt key is pressed.
-    if (altDown)
-    {
-        alignment |= Qt::TextShowMnemonic;
-        alignment &= ~(Qt::TextHideMnemonic);
-    }
-    else
-    {
-        alignment |= Qt::TextHideMnemonic;
-        alignment &= ~(Qt::TextShowMnemonic);
-    }
-
-    QProxyStyle::drawItemText(painter, rectangle, alignment, palette, enabled, text, textRole);
-}
-
-
-bool GuldenEventFilter::eventFilter(QObject *obj, QEvent *evt)
-{
-    if (evt->type() == QEvent::KeyPress || evt->type() == QEvent::KeyRelease)
-    {
-        QKeyEvent *KeyEvent = (QKeyEvent*)evt;
-        if (KeyEvent->key() == Qt::Key_Alt)
-        {
-            guldenProxyStyle->altDown = (evt->type() == QEvent::KeyPress);
-            parentObject->repaint();
-        }
-    }
-    else if(evt->type() == QEvent::ApplicationDeactivate || evt->type() == QEvent::ApplicationStateChange || evt->type() == QEvent::Leave)
-    {
-        if(guldenProxyStyle->altDown)
-        {
-            guldenProxyStyle->altDown = false;
-            parentObject->repaint();
-        }
-    }
-    return QObject::eventFilter(obj, evt);
-}
-
-
 void setValid(QWidget* control, bool validity)
 {
     control->setProperty("valid", validity);
@@ -166,86 +120,27 @@ void burnTextEditMemory(QTextEdit* edit)
     edit->clear();
 }
 
-static void NotifyRequestUnlockS(GuldenGUI* parent, CWallet* wallet, std::string reason)
-{
-    QMetaObject::invokeMethod(parent, "NotifyRequestUnlock", Qt::QueuedConnection, Q_ARG(void*, wallet), Q_ARG(QString, QString::fromStdString(reason)));
-}
-
-static void NotifyRequestUnlockWithCallbackS(GuldenGUI* parent, CWallet* wallet, std::string reason, std::function<void (void)> callback)
-{
-    QMetaObject::invokeMethod(parent, "NotifyRequestUnlockWithCallback", Qt::QueuedConnection, Q_ARG(void*, wallet), Q_ARG(QString, QString::fromStdString(reason)), Q_ARG(std::function<void (void)>, callback));
-}
-
-GuldenGUI::GuldenGUI( GUI* pImpl )
-: QObject()
-, m_pImpl( pImpl )
-, accountBar( NULL )
-, guldenBar( NULL )
-, spacerBarL( NULL )
-, spacerBarR( NULL )
-, tabsBar( NULL )
-, accountInfoBar( NULL )
-, statusBar( NULL )
-, menuBarSpaceFiller( NULL )
-, balanceContainer( NULL )
-, welcomeScreen( NULL )
-, accountScrollArea( NULL )
-, toolsMenu( NULL )
-, importPrivateKeyAction( NULL )
-, rescanAction( NULL )
-, currencyAction ( NULL )
-, dialogNewAccount( NULL )
-, dialogAccountSettings( NULL )
-, dialogBackup( NULL )
-, dialogPasswordModify( NULL )
-, dialogExchangeRate ( NULL )
-, cacheCurrentWidget( NULL )
-, ticker( NULL )
-, nocksSettings( NULL )
-, labelBalance ( NULL )
-, labelBalanceForex ( NULL )
-, passwordAction( NULL )
-, backupAction( NULL )
-, optionsModel( NULL )
-, receiveAddress( NULL )
-, guldenStyle (NULL)
-, guldenEventFilter (NULL)
-{
-    ticker = new CurrencyTicker( this );
-    nocksSettings = new NocksSettings( this );
-
-    //Start the ticker polling off - after the initial call the ticker will schedule the subsequent ones internally.
-    ticker->pollTicker();
-    nocksSettings->pollSettings();
-
-    connect( ticker, SIGNAL( exchangeRatesUpdated() ), this, SLOT( updateExchangeRates() ) );
-
-    uiInterface.RequestUnlock.connect(boost::bind(NotifyRequestUnlockS, this, _1, _2));
-    uiInterface.RequestUnlockWithCallback.connect(boost::bind(NotifyRequestUnlockWithCallbackS, this, _1, _2, _3));
-}
-
-
 bool requestUnlockDialogAlreadyShowing=false;
-void GuldenGUI::NotifyRequestUnlock(void* wallet, QString reason)
+void GUI::NotifyRequestUnlock(void* wallet, QString reason)
 {
     if (!requestUnlockDialogAlreadyShowing)
     {
         requestUnlockDialogAlreadyShowing = true;
-        LogPrintf("NotifyRequestUnlock\n");
-        AskPassphraseDialog dlg(AskPassphraseDialog::Unlock, m_pImpl, reason);
+        LogPrint(BCLog::QT, "NotifyRequestUnlock\n");
+        AskPassphraseDialog dlg(AskPassphraseDialog::Unlock, this, reason);
         dlg.setModel(new WalletModel(NULL, (CWallet*)wallet, NULL, NULL));
         dlg.exec();
         requestUnlockDialogAlreadyShowing = false;
     }
 }
 
-void GuldenGUI::NotifyRequestUnlockWithCallback(void* wallet, QString reason, std::function<void (void)> successCallback)
+void GUI::NotifyRequestUnlockWithCallback(void* wallet, QString reason, std::function<void (void)> successCallback)
 {
     if (!requestUnlockDialogAlreadyShowing)
     {
         requestUnlockDialogAlreadyShowing = true;
-        LogPrintf("NotifyRequestUnlockWithCallback\n");
-        AskPassphraseDialog dlg(AskPassphraseDialog::Unlock, m_pImpl, reason);
+        LogPrint(BCLog::QT, "NotifyRequestUnlockWithCallback\n");
+        AskPassphraseDialog dlg(AskPassphraseDialog::Unlock, this, reason);
         dlg.setModel(new WalletModel(NULL, (CWallet*)wallet, NULL, NULL));
         int result = dlg.exec();
         if(result == QDialog::Accepted)
@@ -254,22 +149,19 @@ void GuldenGUI::NotifyRequestUnlockWithCallback(void* wallet, QString reason, st
     }
 }
 
-void GuldenGUI::handlePaymentAccepted()
+void GUI::handlePaymentAccepted()
 {
+    LogPrint(BCLog::QT, "GUI::handlePaymentAccepted\n");
+
     refreshTabVisibilities();
 }
 
-GuldenGUI::~GuldenGUI()
+void GUI::setBalance(const CAmount& balance, const CAmount& unconfirmedBalance, const CAmount& immatureBalance, const CAmount& watchOnlyBalance, const CAmount& watchUnconfBalance, const CAmount& watchImmatureBalance)
 {
-    if (guldenEventFilter)
-    {
-        m_pImpl->removeEventFilter(guldenEventFilter);
-        delete guldenEventFilter;
-    }
-}
+    LogPrint(BCLog::QT, "GUI::setBalance\n");
+    if (ShutdownRequested())
+        return;
 
-void GuldenGUI::setBalance(const CAmount& balance, const CAmount& unconfirmedBalance, const CAmount& immatureBalance, const CAmount& watchOnlyBalance, const CAmount& watchUnconfBalance, const CAmount& watchImmatureBalance)
-{
     balanceCached = balance;
     unconfirmedBalanceCached = unconfirmedBalance;
     immatureBalanceCached = immatureBalance;
@@ -324,13 +216,16 @@ void GuldenGUI::setBalance(const CAmount& balance, const CAmount& unconfirmedBal
     }
 }
 
-void GuldenGUI::updateExchangeRates()
+void GUI::updateExchangeRates()
 {
+    LogPrint(BCLog::QT, "GUI::updateExchangeRates\n");
     setBalance(balanceCached, unconfirmedBalanceCached, immatureBalanceCached, watchOnlyBalanceCached, watchUnconfBalanceCached, watchImmatureBalanceCached);
 }
 
-void GuldenGUI::requestRenewWitness(CAccount* funderAccount)
+void GUI::requestRenewWitness(CAccount* funderAccount)
 {
+    LogPrint(BCLog::QT, "GUI::requestRenewWitness\n");
+
     CAccount* targetWitnessAccount = pactiveWallet->getActiveAccount();
 
     std::string strError;
@@ -341,7 +236,7 @@ void GuldenGUI::requestRenewWitness(CAccount* funderAccount)
     {
         //fixme: (2.0) Improve error message
         QString message = QString::fromStdString(strError.c_str());
-        QDialog* d = createDialog(m_pImpl, message, tr("Okay"), QString(""), 400, 180);
+        QDialog* d = createDialog(this, message, tr("Okay"), QString(""), 400, 180);
         d->exec();
     }
 
@@ -349,7 +244,7 @@ void GuldenGUI::requestRenewWitness(CAccount* funderAccount)
     questionString.append("<span style='color:#aa0000;'>");
     questionString.append(GuldenUnits::formatHtmlWithUnit(optionsModel->getDisplayUnit(), txFee));
     questionString.append("</span> ");
-    QDialog* d = createDialog(m_pImpl, questionString, tr("Send"), tr("Cancel"), 600, 360);
+    QDialog* d = createDialog(this, questionString, tr("Send"), tr("Cancel"), 600, 360);
 
     int result = d->exec();
     if(result != QDialog::Accepted)
@@ -363,7 +258,7 @@ void GuldenGUI::requestRenewWitness(CAccount* funderAccount)
         {
             //fixme: (2.0) Improve error message
             QString message = QString::fromStdString(strError.c_str());
-            QDialog* d = createDialog(m_pImpl, message, tr("Okay"), QString(""), 400, 180);
+            QDialog* d = createDialog(this, message, tr("Okay"), QString(""), 400, 180);
             d->exec();
         }
     }
@@ -371,74 +266,73 @@ void GuldenGUI::requestRenewWitness(CAccount* funderAccount)
     // Clear the failed flag in UI, and remove the 'renew' button for immediate user feedback.
     targetWitnessAccount->SetWarningState(AccountStatus::WitnessPending);
     static_cast<const CGuldenWallet*>(pactiveWallet)->NotifyAccountWarningChanged(pactiveWallet, targetWitnessAccount);
-    m_pImpl->walletFrame->currentWalletView()->witnessDialogPage->update();
+    walletFrame->currentWalletView()->witnessDialogPage->update();
 }
 
-void GuldenGUI::requestFundWitness(CAccount* funderAccount)
+void GUI::requestFundWitness(CAccount* funderAccount)
 {
+    LogPrint(BCLog::QT, "GUI::requestFundWitness\n");
+
     CAccount* targetWitnessAccount = pactiveWallet->getActiveAccount();
     pactiveWallet->setActiveAccount(funderAccount);
     refreshAccountControls();
-    m_pImpl->gotoSendCoinsPage();
-    m_pImpl->walletFrame->currentWalletView()->sendCoinsPage->gotoWitnessTab(targetWitnessAccount);
+    gotoSendCoinsPage();
+    walletFrame->currentWalletView()->sendCoinsPage->gotoWitnessTab(targetWitnessAccount);
 }
 
-void GuldenGUI::requestEmptyWitness()
+void GUI::requestEmptyWitness()
 {
+    LogPrint(BCLog::QT, "GUI::requestEmptyWitness\n");
+
     CAccount* fromWitnessAccount = pactiveWallet->getActiveAccount();
     CAmount availableAmount = pactiveWallet->GetBalance(fromWitnessAccount, false, true);
     if (availableAmount > 0)
     {
-        m_pImpl->walletFrame->gotoSendCoinsPage();
-        m_pImpl->walletFrame->currentWalletView()->sendCoinsPage->setAmount(availableAmount);
+        walletFrame->gotoSendCoinsPage();
+        walletFrame->currentWalletView()->sendCoinsPage->setAmount(availableAmount);
     }
     else
     {
         QString message = tr("The funds in this account are currently locked for witnessing and cannot be transfered, please wait until lock expires or for earnings to accumulate before trying again.");
-        QDialog* d = createDialog(m_pImpl, message, tr("Okay"), QString(""), 400, 180);
+        QDialog* d = createDialog(this, message, tr("Okay"), QString(""), 400, 180);
         d->exec();
     }
 }
 
-void GuldenGUI::setOptionsModel(OptionsModel* optionsModel_)
+void GUI::setOptionsModel(OptionsModel* optionsModel_)
 {
+    LogPrint(BCLog::QT, "GUI::setOptionsModel\n");
+
     optionsModel = optionsModel_;
     ticker->setOptionsModel(optionsModel);
     optionsModel->setTicker(ticker);
     optionsModel->setNocksSettings(nocksSettings);
-    m_pImpl->accountSummaryWidget->setOptionsModel(optionsModel);
+    if (accountSummaryWidget)
+        accountSummaryWidget->setOptionsModel(optionsModel);
     connect( optionsModel->guldenSettings, SIGNAL(  localCurrencyChanged(QString) ), this, SLOT( updateExchangeRates() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
     updateExchangeRates();
 }
 
-void GuldenGUI::createMenusGulden()
+void GUI::createToolBars()
 {
-    toolsMenu = m_pImpl->appMenuBar->addMenu(tr("&Tools"));
+    LogPrint(BCLog::QT, "GUI::createToolBars\n");
 
-    importPrivateKeyAction = new QAction(m_pImpl->platformStyle->TextColorIcon(":/Gulden/import"), tr("&Import key"), this);
-    importPrivateKeyAction->setStatusTip(tr("Import a private key address"));
-    importPrivateKeyAction->setCheckable(false);
-    toolsMenu->addAction(importPrivateKeyAction);
-    connect(importPrivateKeyAction, SIGNAL(triggered()), this, SLOT(promptImportPrivKey()), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection));
+    if (!walletFrame)
+        return;
 
-    rescanAction = new QAction(m_pImpl->platformStyle->TextColorIcon(":/Gulden/rescan"), tr("&Rescan transactions"), this);
-    rescanAction->setStatusTip(tr("Rescan the blockchain looking for any missing transactions"));
-    rescanAction->setCheckable(false);
-    toolsMenu->addAction(rescanAction);
-    connect(rescanAction, SIGNAL(triggered()), this, SLOT(promptRescan()), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection));
+    QToolBar* toolbar = addToolBar(tr("Tabs toolbar"));
+    toolbar->setMovable(false);
+    toolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    toolbar->addAction(witnessDialogAction);
+    toolbar->addAction(overviewAction);
+    toolbar->addAction(sendCoinsAction);
+    toolbar->addAction(receiveCoinsAction);
+    toolbar->addAction(historyAction);
+    overviewAction->setChecked(true);
 
-    currencyAction = new QAction(m_pImpl->platformStyle->TextColorIcon(":/icons/options"), tr("&Select currency"), this);
-    currencyAction->setStatusTip(tr("Rescan the blockchain looking for any missing transactions"));
-    currencyAction->setCheckable(false);
-    m_pImpl->settingsMenu->addAction(currencyAction);
-    connect(currencyAction, SIGNAL(triggered()), this, SLOT(showExchangeRateDialog()), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection));
-}
-
-void GuldenGUI::createToolBarsGulden()
-{
     //Filler for right of menu bar.
     #ifndef MAC_OSX
-    menuBarSpaceFiller = new QFrame( m_pImpl );
+    menuBarSpaceFiller = new QFrame( this );
     menuBarSpaceFiller->setObjectName( "menuBarSpaceFiller" );
     menuBarSpaceFiller->move(sideBarWidth, 0);
     menuBarSpaceFiller->setFixedSize(20000, 21);
@@ -454,9 +348,10 @@ void GuldenGUI::createToolBarsGulden()
 
     //Horizontally lay out 'My accounts' text and 'wallet settings' button side by side.
     {
-        QFrame* myAccountsFrame = new QFrame( m_pImpl );
+        QFrame* myAccountsFrame = new QFrame( this );
         myAccountsFrame->setObjectName( "frameMyAccounts" );
         QHBoxLayout* layoutMyAccounts = new QHBoxLayout;
+        layoutMyAccounts->setObjectName("my_accounts_layout");
         myAccountsFrame->setLayout(layoutMyAccounts);
         myAccountsFrame->setSizePolicy( QSizePolicy::Expanding, QSizePolicy::Preferred );
         accountBar->addWidget( myAccountsFrame );
@@ -473,6 +368,7 @@ void GuldenGUI::createToolBarsGulden()
         //Spacer to fill width
         {
             QWidget* spacerMid = new QWidget( myAccountsFrame );
+            spacerMid->setObjectName("my_accounts_mid_spacer");
             spacerMid->setSizePolicy( QSizePolicy::Expanding, QSizePolicy::Preferred );
             layoutMyAccounts->addWidget( spacerMid );
         }
@@ -489,8 +385,10 @@ void GuldenGUI::createToolBarsGulden()
 
     //Spacer to fill height
     {
-        QScrollArea* scrollArea = new QScrollArea ( m_pImpl );
+        QScrollArea* scrollArea = new QScrollArea ( this );
+        scrollArea->setObjectName("account_scroll_area");
         accountScrollArea = new QFrame( scrollArea );
+        accountScrollArea->setObjectName("account_scroll_area_frame");
         scrollArea->setContentsMargins( 0, 0, 0, 0);
         scrollArea->setSizePolicy( QSizePolicy::Expanding, QSizePolicy::Expanding );
         scrollArea->setWidget(accountScrollArea);
@@ -503,18 +401,20 @@ void GuldenGUI::createToolBarsGulden()
         accountBar->addWidget( scrollArea );
 
         QVBoxLayout* vbox = new QVBoxLayout();
+        vbox->setObjectName("account_scroll_area_frame");
         vbox->setSpacing(0);
         vbox->setContentsMargins( 0, 0, 0, 0 );
 
         accountScrollArea->setLayout( vbox );
     }
 
-    QPushButton* addAccButton = new QPushButton( m_pImpl );
-    addAccButton->setText( "\uf067 "+tr("Add account") );
+    ClickableLabel* addAccButton = new ClickableLabel( this );
     addAccButton->setObjectName( "add_account_button" );
+    addAccButton->setTextFormat( Qt::RichText );
+    addAccButton->setText( GUIUtil::fontAwesomeRegular("\uf067 ")+tr("Add account") );
     addAccButton->setCursor( Qt::PointingHandCursor );
     accountBar->addWidget( addAccButton );
-    m_pImpl->addToolBar( Qt::LeftToolBarArea, accountBar );
+    addToolBar( Qt::LeftToolBarArea, accountBar );
     connect( addAccButton, SIGNAL( clicked() ), this, SLOT( gotoNewAccountDialog() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
 
 
@@ -526,11 +426,11 @@ void GuldenGUI::createToolBarsGulden()
 
     //Add the 'Gulden bar' - on the left with the Gulden sign and balance
     guldenBar = new QToolBar( QCoreApplication::translate( "toolbar", "Overview toolbar" ) );
+    guldenBar->setObjectName( "gulden_bar" );
     guldenBar->setFixedHeight( horizontalBarHeight );
     guldenBar->setFixedWidth( sideBarWidth );
     guldenBar->setSizePolicy( QSizePolicy::Fixed, QSizePolicy::Fixed );
     guldenBar->setMinimumWidth( sideBarWidth );
-    guldenBar->setObjectName( "gulden_bar" );
     guldenBar->setMovable( false );
     guldenBar->setToolButtonStyle( Qt::ToolButtonIconOnly );
     guldenBar->setIconSize( QSize( 18, 18 ) );
@@ -539,7 +439,9 @@ void GuldenGUI::createToolBarsGulden()
     // We place all the widgets for this action bar inside a frame of fixed width - otherwise the sizing comes out wrong
     {
         balanceContainer = new QFrame();
+        balanceContainer->setObjectName("balance_container");
         QHBoxLayout* layoutBalance = new QHBoxLayout;
+        layoutBalance->setObjectName("balance_layout");
         balanceContainer->setLayout(layoutBalance);
         balanceContainer->setSizePolicy( QSizePolicy::Expanding, QSizePolicy::Preferred );
         balanceContainer->setContentsMargins( 0, 0, 0, 0 );
@@ -556,7 +458,7 @@ void GuldenGUI::createToolBarsGulden()
             layoutBalance->addWidget( spacerL );
         }
 
-        QLabel* homeIcon = new ClickableLabel( m_pImpl );
+        QLabel* homeIcon = new ClickableLabel( this );
         homeIcon->setText("\u0120");
         layoutBalance->addWidget( homeIcon );
         homeIcon->setObjectName( "home_button" );
@@ -566,16 +468,17 @@ void GuldenGUI::createToolBarsGulden()
         // Use spacer to push balance label to the right
         {
             QWidget* spacerMid = new QWidget();
+            spacerMid->setObjectName("layout_balance_mid_spacer");
             spacerMid->setSizePolicy( QSizePolicy::Expanding, QSizePolicy::Preferred );
             layoutBalance->addWidget( spacerMid );
         }
 
-        labelBalance = new ClickableLabel( m_pImpl );
+        labelBalance = new ClickableLabel( this );
         labelBalance->setObjectName( "gulden_label_balance" );
         labelBalance->setText( "" );
         layoutBalance->addWidget( labelBalance );
 
-        labelBalanceForex = new ClickableLabel( m_pImpl );
+        labelBalanceForex = new ClickableLabel( this );
         labelBalanceForex->setObjectName( "gulden_label_balance_forex" );
         labelBalanceForex->setText( "" );
         labelBalanceForex->setCursor( Qt::PointingHandCursor );
@@ -593,7 +496,7 @@ void GuldenGUI::createToolBarsGulden()
 
         balanceContainer->setMinimumWidth( sideBarWidth );
     }
-    m_pImpl->addToolBar( guldenBar );
+    addToolBar( guldenBar );
 
 
 
@@ -601,45 +504,48 @@ void GuldenGUI::createToolBarsGulden()
     //Add spacer bar
     spacerBarL = new QToolBar( QCoreApplication::translate( "toolbar", "Spacer  toolbar" ) );
     spacerBarL->setFixedHeight( horizontalBarHeight );
-    spacerBarL->setObjectName( "spacer_bar" );
+    spacerBarL->setObjectName( "spacer_bar_left" );
     spacerBarL->setMovable( false );
     //Spacer to fill width
     {
-        QWidget* spacerR = new QWidget();
-        spacerR->setMinimumWidth( 40 );
-        spacerR->setSizePolicy( QSizePolicy::Expanding, QSizePolicy::Preferred );
-        spacerBarL->addWidget( spacerR );
+        QWidget* spacerL = new QWidget();
+        spacerL->setObjectName( "spacer_bar_left_spacer" );
+        spacerL->setMinimumWidth( 40 );
+        spacerL->setSizePolicy( QSizePolicy::Expanding, QSizePolicy::Preferred );
+        spacerBarL->addWidget( spacerL );
         spacerBarL->setSizePolicy( QSizePolicy::Fixed, QSizePolicy::Fixed );
     }
-    m_pImpl->addToolBar( spacerBarL );
+    addToolBar( spacerBarL );
 
 
-    tabsBar = m_pImpl->findChildren<QToolBar*>( "" )[0];
+    tabsBar = findChildren<QToolBar*>( "" )[0];
     //Add the main toolbar - middle (tabs)
     tabsBar->setFixedHeight( horizontalBarHeight );
     tabsBar->setObjectName( "navigation_bar" );
     tabsBar->setMovable( false );
     tabsBar->setToolButtonStyle( Qt::ToolButtonTextOnly );
     //Remove all the actions so we can add them again in a different order
-    tabsBar->removeAction( m_pImpl->historyAction );
-    tabsBar->removeAction( m_pImpl->overviewAction );
-    tabsBar->removeAction( m_pImpl->sendCoinsAction );
-    tabsBar->removeAction( m_pImpl->receiveCoinsAction );
-    tabsBar->removeAction( m_pImpl->witnessDialogAction );
+    tabsBar->removeAction( historyAction );
+    tabsBar->removeAction( overviewAction );
+    tabsBar->removeAction( sendCoinsAction );
+    tabsBar->removeAction( receiveCoinsAction );
+    tabsBar->removeAction( witnessDialogAction );
     //Setup the tab toolbar
-    tabsBar->addAction( m_pImpl->witnessDialogAction );
-    tabsBar->addAction( m_pImpl->receiveCoinsAction );
-    tabsBar->addAction( m_pImpl->sendCoinsAction );
-    tabsBar->addAction( m_pImpl->historyAction );
+    tabsBar->addAction( witnessDialogAction );
+    tabsBar->addAction( receiveCoinsAction );
+    tabsBar->addAction( sendCoinsAction );
+    tabsBar->addAction( historyAction );
 
-    passwordAction = new QAction(m_pImpl->platformStyle->SingleColorIcon(":/icons/password"), tr("&Password"), this);
+    passwordAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf084), tr("&Password"), this);
+    passwordAction->setObjectName("action_password");
     passwordAction->setStatusTip(tr("Change wallet password"));
     passwordAction->setToolTip(passwordAction->statusTip());
     passwordAction->setCheckable(true);
     passwordAction->setShortcut(QKeySequence(Qt::ALT + Qt::Key_5));
     tabsBar->addAction(passwordAction);
 
-    backupAction = new QAction(m_pImpl->platformStyle->SingleColorIcon(":/icons/backup"), tr("&Backup"), this);
+    backupAction = new QAction(GUIUtil::getIconFromFontAwesomeRegularGlyph(0xf0c7), tr("&Backup"), this);
+    backupAction->setObjectName("action_backup");
     backupAction->setStatusTip(tr("Backup wallet"));
     backupAction->setToolTip(backupAction->statusTip());
     backupAction->setCheckable(true);
@@ -650,25 +556,33 @@ void GuldenGUI::createToolBarsGulden()
     connect(backupAction, SIGNAL(triggered()), this, SLOT(gotoBackupDialog()), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection));
 
 
-    m_pImpl->receiveCoinsAction->setChecked( true );
+    receiveCoinsAction->setChecked( true );
 
-    tabsBar->widgetForAction( m_pImpl->historyAction )->setCursor( Qt::PointingHandCursor );
-    tabsBar->widgetForAction( m_pImpl->sendCoinsAction )->setCursor( Qt::PointingHandCursor );
-    tabsBar->widgetForAction( m_pImpl->receiveCoinsAction )->setCursor( Qt::PointingHandCursor );
-    tabsBar->widgetForAction( m_pImpl->witnessDialogAction )->setCursor( Qt::PointingHandCursor );
+    tabsBar->widgetForAction( historyAction )->setCursor( Qt::PointingHandCursor );
+
+    tabsBar->widgetForAction( passwordAction )->setObjectName( "password_button" );
+    tabsBar->widgetForAction( passwordAction )->setContentsMargins( 0, 0, 0, 0 );
     tabsBar->widgetForAction( passwordAction )->setCursor( Qt::PointingHandCursor );
+    tabsBar->widgetForAction( backupAction )->setObjectName( "backup_button" );
+    tabsBar->widgetForAction( backupAction )->setContentsMargins( 0, 0, 0, 0 );
     tabsBar->widgetForAction( backupAction )->setCursor( Qt::PointingHandCursor );
-    tabsBar->widgetForAction( m_pImpl->receiveCoinsAction )->setObjectName( "receive_coins_button" );
-    tabsBar->widgetForAction( m_pImpl->receiveCoinsAction )->setContentsMargins( 0, 0, 0, 0 );
-    tabsBar->widgetForAction( m_pImpl->receiveCoinsAction )->setContentsMargins( 0, 0, 0, 0 );
-    tabsBar->widgetForAction( m_pImpl->sendCoinsAction )->setContentsMargins( 0, 0, 0, 0 );
-    tabsBar->widgetForAction( m_pImpl->historyAction )->setContentsMargins( 0, 0, 0, 0 );
-    tabsBar->widgetForAction( m_pImpl->witnessDialogAction )->setContentsMargins( 0, 0, 0, 0 );
+    tabsBar->widgetForAction( receiveCoinsAction )->setObjectName( "receive_coins_button" );
+    tabsBar->widgetForAction( receiveCoinsAction )->setContentsMargins( 0, 0, 0, 0 );
+    tabsBar->widgetForAction( receiveCoinsAction )->setCursor( Qt::PointingHandCursor );
+    tabsBar->widgetForAction( sendCoinsAction )->setObjectName( "send_coins_button" );
+    tabsBar->widgetForAction( sendCoinsAction )->setContentsMargins( 0, 0, 0, 0 );
+    tabsBar->widgetForAction( sendCoinsAction )->setCursor( Qt::PointingHandCursor );
+    tabsBar->widgetForAction( historyAction )->setObjectName( "history_button" );
+    tabsBar->widgetForAction( historyAction )->setContentsMargins( 0, 0, 0, 0 );
+    tabsBar->widgetForAction( witnessDialogAction )->setObjectName( "witness_button" );
+    tabsBar->widgetForAction( witnessDialogAction )->setContentsMargins( 0, 0, 0, 0 );
+    tabsBar->widgetForAction( witnessDialogAction )->setCursor( Qt::PointingHandCursor );
     tabsBar->setContentsMargins( 0, 0, 0, 0 );
 
     //Spacer to fill width
     {
         QWidget* spacerR = new QWidget();
+        spacerR->setObjectName("navigation_bar_right_spacer");
         spacerR->setSizePolicy( QSizePolicy::Expanding, QSizePolicy::Preferred );
         //Delibritely large amount - to push the next toolbar as far right as possible.
         spacerR->setMinimumWidth( 500000 );
@@ -676,14 +590,14 @@ void GuldenGUI::createToolBarsGulden()
         tabsBar->setSizePolicy( QSizePolicy::Expanding, QSizePolicy::Expanding );
     }
     //Only show the actions we want
-    m_pImpl->receiveCoinsAction->setVisible( true );
-    m_pImpl->sendCoinsAction->setVisible( true );
-    m_pImpl->historyAction->setVisible( true );
+    receiveCoinsAction->setVisible( true );
+    sendCoinsAction->setVisible( true );
+    historyAction->setVisible( true );
     passwordAction->setVisible( false );
     backupAction->setVisible( false );
-    m_pImpl->overviewAction->setVisible( false );
+    overviewAction->setVisible( false );
     tabsBar->setWindowTitle( QCoreApplication::translate( "toolbar", "Navigation toolbar" ) );
-    m_pImpl->addToolBar( tabsBar );
+    addToolBar( tabsBar );
 
 
 
@@ -696,86 +610,84 @@ void GuldenGUI::createToolBarsGulden()
     accountInfoBar->setObjectName( "account_info_bar" );
     accountInfoBar->setMovable( false );
     accountInfoBar->setToolButtonStyle( Qt::ToolButtonIconOnly );
-    m_pImpl->accountSummaryWidget = new AccountSummaryWidget( ticker, m_pImpl );
-    m_pImpl->accountSummaryWidget->setObjectName( "settings_button" );
-    m_pImpl->accountSummaryWidget->setContentsMargins( 0, 0, 0, 0 );
+    accountSummaryWidget = new AccountSummaryWidget( ticker, this );
+    accountSummaryWidget->setObjectName( "settings_button" );
+    accountSummaryWidget->setContentsMargins( 0, 0, 0, 0 );
     accountInfoBar->setContentsMargins( 0, 0, 0, 0 );
-    m_pImpl->accountSummaryWidget->setObjectName( "accountSummaryWidget" );
-    accountInfoBar->addWidget( m_pImpl->accountSummaryWidget );
-    m_pImpl->addToolBar( accountInfoBar );
-    connect(m_pImpl->accountSummaryWidget, SIGNAL( requestAccountSettings() ), this, SLOT( showAccountSettings() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
-    connect(m_pImpl->accountSummaryWidget, SIGNAL( requestExchangeRateDialog() ), this, SLOT( showExchangeRateDialog() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
+    accountSummaryWidget->setObjectName( "accountSummaryWidget" );
+    accountInfoBar->addWidget( accountSummaryWidget );
+    addToolBar( accountInfoBar );
+    connect(accountSummaryWidget, SIGNAL( requestAccountSettings() ), this, SLOT( showAccountSettings() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
+    connect(accountSummaryWidget, SIGNAL( requestExchangeRateDialog() ), this, SLOT( showExchangeRateDialog() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
 
 
     //Add spacer bar
     spacerBarR = new QToolBar( QCoreApplication::translate( "toolbar", "Spacer  toolbar" ) );
     spacerBarR->setFixedHeight( horizontalBarHeight );
-    spacerBarR->setObjectName( "spacer_bar" );
+    spacerBarR->setObjectName( "spacer_bar_right" );
     spacerBarR->setMovable( false );
     //Spacer to fill width
     {
         QWidget* spacerR = new QWidget();
+        spacerR->setObjectName("spacer_bar_right_spacer");
         spacerR->setMinimumWidth( 40 );
         spacerR->setSizePolicy( QSizePolicy::Expanding, QSizePolicy::Preferred );
         spacerBarR->addWidget( spacerR );
         spacerBarR->setSizePolicy( QSizePolicy::Fixed, QSizePolicy::Fixed );
     }
-    m_pImpl->addToolBar( spacerBarR );
+    addToolBar( spacerBarR );
 
-    //Hide all toolbars until UI fully loaded
+    //Hide all toolbars and menus until UI fully loaded
     hideToolBars();
+    appMenuBar->setVisible(false);
 
 
     //Init the welcome dialog inside walletFrame
-    welcomeScreen = new WelcomeDialog(m_pImpl->platformStyle, m_pImpl);
-    m_pImpl->walletFrame->walletStack->addWidget(welcomeScreen);
-    m_pImpl->walletFrame->walletStack->setCurrentWidget(welcomeScreen);
-    connect(welcomeScreen, SIGNAL( loadWallet() ), m_pImpl->walletFrame, SIGNAL( loadWallet() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection));
+    welcomeScreen = new WelcomeDialog(platformStyle, this);
+    walletFrame->walletStack->addWidget(welcomeScreen);
+    walletFrame->walletStack->setCurrentWidget(welcomeScreen);
+    connect(welcomeScreen, SIGNAL( loadWallet() ), walletFrame, SIGNAL( loadWallet() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection));
 }
 
-void GuldenGUI::hideToolBars()
+void GUI::hideToolBars()
 {
-    if(accountBar) accountBar->setVisible(false);
-    if(guldenBar) guldenBar->setVisible(false);
-    if(spacerBarL) spacerBarL->setVisible(false);
-    if(tabsBar) tabsBar->setVisible(false);
-    if(spacerBarR) spacerBarR->setVisible(false);
-    if(accountInfoBar) accountInfoBar->setVisible(false);
-    if(statusBar) statusBar->setVisible(false);
+    LogPrint(BCLog::QT, "GUI::hideToolBars\n");
+
+    if (accountBar) accountBar->setVisible(false);
+    if (guldenBar) guldenBar->setVisible(false);
+    if (spacerBarL) spacerBarL->setVisible(false);
+    if (tabsBar) tabsBar->setVisible(false);
+    if (spacerBarR) spacerBarR->setVisible(false);
+    if (accountInfoBar) accountInfoBar->setVisible(false);
+    if (statusToolBar) statusToolBar->setVisible(false);
 }
 
-void GuldenGUI::showToolBars()
+void GUI::showToolBars()
 {
+    LogPrint(BCLog::QT, "GUI::showToolBars\n");
+
     welcomeScreen = NULL;
-    m_pImpl->appMenuBar->setStyleSheet("");
-
-    if(accountBar) accountBar->setVisible(true);
-    if(guldenBar) guldenBar->setVisible(true);
-    if(spacerBarL) spacerBarL->setVisible(true);
-    if(tabsBar) tabsBar->setVisible(true);
-    if(spacerBarR) spacerBarR->setVisible(true);
-    if(accountInfoBar) accountInfoBar->setVisible(true);
-    if(statusBar) statusBar->setVisible(m_pImpl->progressBarLabel->isVisible());
+    if (appMenuBar) appMenuBar->setStyleSheet("");
+    if (accountBar) accountBar->setVisible(true);
+    if (guldenBar) guldenBar->setVisible(true);
+    if (spacerBarL) spacerBarL->setVisible(true);
+    if (tabsBar) tabsBar->setVisible(true);
+    if (spacerBarR) spacerBarR->setVisible(true);
+    if (accountInfoBar) accountInfoBar->setVisible(true);
+    if (statusToolBar) statusToolBar->setVisible(progressBarLabel ? progressBarLabel->isVisible() : false);
 }
 
 
-void GuldenGUI::doApplyStyleSheet()
+void GUI::doApplyStyleSheet()
 {
+    LogPrint(BCLog::QT, "GUI::doApplyStyleSheet\n");
+
+    if(!enableWallet || !enableFullUI)
+        return;
+
     //Load our own QSS stylesheet template for 'whole app'
     QFile styleFile( ":Gulden/qss" );
     styleFile.open( QFile::ReadOnly );
-
-    //Use the same style on all platforms to simplify skinning
-    guldenStyle = new GuldenProxyStyle();
-    QApplication::setStyle( guldenStyle );
-
-    if (guldenEventFilter)
-    {
-        m_pImpl->removeEventFilter(guldenEventFilter);
-        delete guldenEventFilter;
-    }
-    guldenEventFilter = new GuldenEventFilter(m_pImpl->style(), m_pImpl, guldenStyle);
-    m_pImpl->installEventFilter(guldenEventFilter);
 
     //Replace variables in the 'template' with actual values
     QString style( styleFile.readAll() );
@@ -783,7 +695,7 @@ void GuldenGUI::doApplyStyleSheet()
     style.replace( "ACCENT_COLOR_2", QString(ACCENT_COLOR_2) );
     style.replace( "TEXT_COLOR_1", QString(TEXT_COLOR_1) );
     style.replace( "COLOR_VALIDATION_FAILED", QString(COLOR_VALIDATION_FAILED) );
-    
+
     if (sideBarWidth == sideBarWidthExtended)
     {
         style.replace( "SIDE_BAR_WIDTH", SIDE_BAR_WIDTH_EXTENDED );
@@ -801,11 +713,13 @@ void GuldenGUI::doApplyStyleSheet()
 
     //Apply the final QSS - after making the 'template substitutions'
     //NB! This should happen last after all object IDs etc. are set.
-    m_pImpl->setStyleSheet( style );
+    setStyleSheet( style );
 }
 
-void GuldenGUI::resizeToolBarsGulden()
+void GUI::resizeToolBarsGulden()
 {
+    LogPrint(BCLog::QT, "GUI::resizeToolBarsGulden\n");
+
     //Filler for right of menu bar.
     #ifndef MAC_OSX
     menuBarSpaceFiller->move(sideBarWidth, 0);
@@ -817,44 +731,45 @@ void GuldenGUI::resizeToolBarsGulden()
     balanceContainer->setMinimumWidth( sideBarWidth );
 }
 
-void GuldenGUI::doPostInit()
+void GUI::doPostInit()
 {
+    LogPrint(BCLog::QT, "GUI::doPostInit\n");
+
     //Fonts
     // We 'abuse' the translation system here to allow different 'font stacks' for different languages.
     //QString MAIN_FONTSTACK = QObject::tr("Arial, 'Helvetica Neue', Helvetica, sans-serif");
 
-    m_pImpl->appMenuBar->setStyleSheet("QMenuBar{background-color: rgba(255, 255, 255, 0%);} QMenu{background-color: #f3f4f6; border: 1px solid #999; color: black;} QMenu::item { color: black; } QMenu::item:disabled {color: #999;} QMenu::separator{background-color: #999; height: 1px; margin-left: 10px; margin-right: 5px;}");
+    appMenuBar->setStyleSheet("QMenuBar{background-color: rgba(255, 255, 255, 0%);} QMenu{background-color: #f3f4f6; border: 1px solid #999; color: black;} QMenu::item { color: black; } QMenu::item:disabled {color: #999;} QMenu::separator{background-color: #999; height: 1px; margin-left: 10px; margin-right: 5px;}");
 
 
     {
         // Qt status bar sucks - it is impossible to style nicely, so we just rip the thing out and use a toolbar instead.
-        m_pImpl->statusBar()->setVisible(false);
+        statusBar()->setVisible(false);
 
         //Allow us to target the progress label for easy styling
-        //m_pImpl->statusBar()->removeWidget(m_pImpl->progressBarLabel);
-        //m_pImpl->statusBar()->removeWidget(m_pImpl->progressBar);
-        //m_pImpl->statusBar()->removeWidget(m_pImpl->frameBlocks);
+        //statusBar()->removeWidget(progressBarLabel);
+        //statusBar()->removeWidget(progressBar);
+        //statusBar()->removeWidget(frameBlocks);
 
         //Add a spacer to the frameBlocks so that we can force them to expand to same size as the progress text (Needed for proper centering of progress bar)
-        /*QFrame* frameBlocksSpacerL = new QFrame(m_pImpl->frameBlocks);
+        /*QFrame* frameBlocksSpacerL = new QFrame(frameBlocks);
         frameBlocksSpacerL->setSizePolicy(QSizePolicy::Expanding,QSizePolicy::Preferred);
         frameBlocksSpacerL->setContentsMargins( 0, 0, 0, 0);
-        ((QHBoxLayout*)m_pImpl->frameBlocks->layout())->insertWidget(0, frameBlocksSpacerL);*/
+        ((QHBoxLayout*)frameBlocks->layout())->insertWidget(0, frameBlocksSpacerL);*/
 
-        m_pImpl->frameBlocks->layout()->setContentsMargins( 0, 0, 0, 0 );
-        m_pImpl->frameBlocks->layout()->setSpacing( 0 );
+        frameBlocks->layout()->setContentsMargins( 0, 0, 0, 0 );
+        frameBlocks->layout()->setSpacing( 0 );
 
         //Hide some of the 'task items' we don't need
-        m_pImpl->unitDisplayControl->setVisible( false );
-        //m_pImpl->labelBlocksIcon->setVisible( false );
+        //labelBlocksIcon->setVisible( false );
 
         //Status bar
         {
-            statusBar = new QToolBar( QCoreApplication::translate( "toolbar", "Status toolbar" ) , m_pImpl);
-            statusBar->setObjectName( "status_bar" );
-            statusBar->setMovable( false );
+            statusToolBar = new QToolBar( QCoreApplication::translate( "toolbar", "Status toolbar" ), this);
+            statusToolBar->setObjectName( "status_bar" );
+            statusToolBar->setMovable( false );
 
-            QFrame* statusBarStatusArea = new QFrame(statusBar);
+            QFrame* statusBarStatusArea = new QFrame(statusToolBar);
             statusBarStatusArea->setObjectName("status_bar_status_area");
             statusBarStatusArea->setSizePolicy(QSizePolicy::Expanding,QSizePolicy::Preferred);
             statusBarStatusArea->setContentsMargins( 0, 0, 0, 0);
@@ -862,67 +777,67 @@ void GuldenGUI::doPostInit()
             statusBarStatusArea->setLayout(statusBarStatusAreaLayout);
             statusBarStatusAreaLayout->setSpacing(0);
             statusBarStatusAreaLayout->setContentsMargins( 0, 0, 0, 0 );
-            statusBar->addWidget(statusBarStatusArea);
+            statusToolBar->addWidget(statusBarStatusArea);
 
-            m_pImpl->progressBarLabel->setObjectName("progress_bar_label");
-            statusBarStatusAreaLayout->addWidget(m_pImpl->progressBarLabel);
+            progressBarLabel->setObjectName("progress_bar_label");
+            statusBarStatusAreaLayout->addWidget(progressBarLabel);
 
-            QFrame* statusProgressSpacerL = new QFrame(statusBar);
+            QFrame* statusProgressSpacerL = new QFrame(statusToolBar);
             statusProgressSpacerL->setObjectName("progress_bar_spacer_left");
             statusProgressSpacerL->setSizePolicy(QSizePolicy::Expanding,QSizePolicy::Preferred);
             statusProgressSpacerL->setContentsMargins( 0, 0, 0, 0);
-            statusBar->addWidget(statusProgressSpacerL);
+            statusToolBar->addWidget(statusProgressSpacerL);
 
-            QFrame* progressBarWrapper = new QFrame(statusBar);
+            QFrame* progressBarWrapper = new QFrame(statusToolBar);
             progressBarWrapper->setObjectName("progress_bar");
             progressBarWrapper->setSizePolicy(QSizePolicy::Maximum,QSizePolicy::Preferred);
             progressBarWrapper->setContentsMargins( 0, 0, 0, 0);
             QHBoxLayout* layoutProgressBarWrapper = new QHBoxLayout;
             progressBarWrapper->setLayout(layoutProgressBarWrapper);
-            layoutProgressBarWrapper->addWidget(m_pImpl->progressBar);
-            statusBar->addWidget(progressBarWrapper);
-            m_pImpl->progressBar->setVisible(false);
+            layoutProgressBarWrapper->addWidget(progressBar);
+            statusToolBar->addWidget(progressBarWrapper);
+            progressBar->setVisible(false);
 
-            QFrame* statusProgressSpacerR = new QFrame(statusBar);
+            QFrame* statusProgressSpacerR = new QFrame(statusToolBar);
             statusProgressSpacerR->setObjectName("progress_bar_spacer_right");
             statusProgressSpacerR->setSizePolicy(QSizePolicy::Expanding,QSizePolicy::Preferred);
             statusProgressSpacerR->setContentsMargins( 0, 0, 0, 0);
-            statusBar->addWidget(statusProgressSpacerR);
+            statusToolBar->addWidget(statusProgressSpacerR);
 
-            m_pImpl->frameBlocks->setSizePolicy( QSizePolicy::Preferred, QSizePolicy::Preferred );
-            m_pImpl->frameBlocks->setObjectName("status_bar_frame_blocks");
+            frameBlocks->setSizePolicy( QSizePolicy::Preferred, QSizePolicy::Preferred );
+            frameBlocks->setObjectName("status_bar_frame_blocks");
             //Use spacer to push all the icons to the right
-            QFrame* frameBlocksSpacerL = new QFrame(m_pImpl->frameBlocks);
+            QFrame* frameBlocksSpacerL = new QFrame(frameBlocks);
             frameBlocksSpacerL->setSizePolicy(QSizePolicy::Expanding,QSizePolicy::Preferred);
             frameBlocksSpacerL->setContentsMargins( 0, 0, 0, 0);
-            ((QHBoxLayout*)m_pImpl->frameBlocks->layout())->insertWidget(0, frameBlocksSpacerL, 1);
-            statusBar->addWidget(m_pImpl->frameBlocks);
+            ((QHBoxLayout*)frameBlocks->layout())->insertWidget(0, frameBlocksSpacerL, 1);
+            statusToolBar->addWidget(frameBlocks);
             //Right margin to match rest of UI
-            QFrame* frameBlocksSpacerR = new QFrame(m_pImpl->frameBlocks);
+            QFrame* frameBlocksSpacerR = new QFrame(frameBlocks);
             frameBlocksSpacerR->setObjectName("rightMargin");
             frameBlocksSpacerR->setSizePolicy(QSizePolicy::Preferred,QSizePolicy::Preferred);
             frameBlocksSpacerR->setContentsMargins( 0, 0, 0, 0);
-            ((QHBoxLayout*)m_pImpl->frameBlocks->layout())->addWidget(frameBlocksSpacerR);
+            ((QHBoxLayout*)frameBlocks->layout())->addWidget(frameBlocksSpacerR);
 
             //Use our own styling - clear the styling that is already applied
-            m_pImpl->progressBar->setStyleSheet("");
+            progressBar->setStyleSheet("");
             //Hide text we don't want it as it looks cluttered.
-            m_pImpl->progressBar->setTextVisible(false);
-            m_pImpl->progressBar->setCursor(Qt::PointingHandCursor);
+            progressBar->setTextVisible(false);
+            progressBar->setCursor(Qt::PointingHandCursor);
 
-            m_pImpl->addToolBar( Qt::BottomToolBarArea, statusBar );
+            addToolBar( Qt::BottomToolBarArea, statusToolBar );
 
-            statusBar->setVisible(false);
+            statusToolBar->setVisible(false);
         }
     }
 
-    m_pImpl->backupWalletAction->setIconText( QCoreApplication::translate( "toolbar", "Backup" ) );
+    backupWalletAction->setIconText( QCoreApplication::translate( "toolbar", "Backup" ) );
 
     //Change shortcut keys because we have hidden overview pane and changed tab orders
-    m_pImpl->overviewAction->setShortcut( QKeySequence( Qt::ALT + Qt::Key_0 ) );
-    m_pImpl->sendCoinsAction->setShortcut( QKeySequence( Qt::ALT + Qt::Key_2 ) );
-    m_pImpl->receiveCoinsAction->setShortcut( QKeySequence( Qt::ALT + Qt::Key_3 ) );
-    m_pImpl->historyAction->setShortcut( QKeySequence( Qt::ALT + Qt::Key_1 ) );
+    overviewAction->setShortcut( QKeySequence( Qt::ALT + Qt::Key_0 ) );
+    sendCoinsAction->setShortcut( QKeySequence( Qt::ALT + Qt::Key_2 ) );
+    receiveCoinsAction->setShortcut( QKeySequence( Qt::ALT + Qt::Key_3 ) );
+    historyAction->setShortcut( QKeySequence( Qt::ALT + Qt::Key_1 ) );
 
     doApplyStyleSheet();
 
@@ -931,65 +846,83 @@ void GuldenGUI::doPostInit()
     f.setStyleStrategy( QFont::PreferAntialias );
     QApplication::setFont( f );
 
-    m_pImpl->openAction->setVisible(false);
+    openAction->setVisible(false);
 
-    m_pImpl->setContextMenuPolicy(Qt::NoContextMenu);
+    setContextMenuPolicy(Qt::NoContextMenu);
 
-    m_pImpl->setMinimumSize(860, 520);
+    setMinimumSize(860, 520);
 
-    disconnect(m_pImpl->backupWalletAction, SIGNAL(triggered()), 0, 0);
-    connect(m_pImpl->backupWalletAction, SIGNAL(triggered()), this, SLOT(gotoBackupDialog()), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection));
+    disconnect(backupWalletAction, SIGNAL(triggered()), 0, 0);
+    connect(backupWalletAction, SIGNAL(triggered()), this, SLOT(gotoBackupDialog()), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection));
 
-    m_pImpl->encryptWalletAction->setCheckable(false);
-    disconnect(m_pImpl->encryptWalletAction, SIGNAL(triggered()), 0, 0);
-    connect(m_pImpl->encryptWalletAction, SIGNAL(triggered()), this, SLOT(gotoPasswordDialog()), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection));
+    encryptWalletAction->setCheckable(false);
+    disconnect(encryptWalletAction, SIGNAL(triggered()), 0, 0);
+    connect(encryptWalletAction, SIGNAL(triggered()), this, SLOT(gotoPasswordDialog()), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection));
 
-    disconnect(m_pImpl->changePassphraseAction, SIGNAL(triggered()), 0, 0);
-    connect(m_pImpl->changePassphraseAction, SIGNAL(triggered()), this, SLOT(gotoPasswordDialog()), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection));
+    disconnect(changePassphraseAction, SIGNAL(triggered()), 0, 0);
+    connect(changePassphraseAction, SIGNAL(triggered()), this, SLOT(gotoPasswordDialog()), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection));
 
-    labelBalance->setVisible(false);
+    if (labelBalance)
+        labelBalance->setVisible(false);
 }
 
-void GuldenGUI::hideProgressBarLabel()
+void GUI::hideProgressBarLabel()
 {
-    m_pImpl->progressBarLabel->setText("");
-    m_pImpl->progressBarLabel->setVisible(false);
-    if(statusBar)
-        statusBar->setVisible(false);
+    LogPrint(BCLog::QT, "GUI::hideProgressBarLabel\n");
+
+    if (progressBarLabel)
+    {
+        progressBarLabel->setText("");
+        progressBarLabel->setVisible(false);
+    }
+    if(statusToolBar)
+        statusToolBar->setVisible(false);
 }
 
-void GuldenGUI::showProgressBarLabel()
+void GUI::showProgressBarLabel()
 {
-    m_pImpl->progressBarLabel->setVisible(true);
-    if(statusBar)
-        statusBar->setVisible(true);
+    LogPrint(BCLog::QT, "GUI::showProgressBarLabel\n");
+
+    if (progressBarLabel)
+        progressBarLabel->setVisible(true);
+    if(statusToolBar)
+        statusToolBar->setVisible(true);
 }
 
-void GuldenGUI::hideBalances()
+void GUI::hideBalances()
 {
+    LogPrint(BCLog::QT, "GUI::hideBalances\n");
+
+    if (!labelBalance)
+        return;
+
     labelBalance->setVisible(false);
     labelBalanceForex->setVisible(false);
-    m_pImpl->accountSummaryWidget->hideBalances();
+    accountSummaryWidget->hideBalances();
 }
 
-void GuldenGUI::showBalances()
+void GUI::showBalances()
 {
-    if (!labelBalance->isVisible())
-    {
-        labelBalance->setVisible(true);
-        // Give forex label a chance to update if appropriate.
-        updateExchangeRates();
-        m_pImpl->accountSummaryWidget->showBalances();
-    }
+    LogPrint(BCLog::QT, "GUI::showBalances\n");
+
+    if (!labelBalance || !labelBalance->isVisible())
+        return;
+
+    labelBalance->setVisible(true);
+    // Give forex label a chance to update if appropriate.
+    updateExchangeRates();
+    accountSummaryWidget->showBalances();
 }
 
-bool GuldenGUI::welcomeScreenIsVisible()
+bool GUI::welcomeScreenIsVisible()
 {
     return welcomeScreen != NULL;
 }
 
-QDialog* GuldenGUI::createDialog(QWidget* parent, QString message, QString confirmLabel, QString cancelLabel, int minWidth, int minHeight)
+QDialog* GUI::createDialog(QWidget* parent, QString message, QString confirmLabel, QString cancelLabel, int minWidth, int minHeight)
 {
+    LogPrint(BCLog::QT, "GUI::createDialog\n");
+
     QDialog* d = new QDialog(parent);
     d->setWindowFlags(Qt::Dialog);
     d->setMinimumSize(QSize(minWidth, minHeight));
@@ -1062,7 +995,7 @@ QString limitString(const QString& string, int maxLength)
     auto beforeEllipsis = string.left(std::ceil(spacePerPart));
     auto afterEllipsis = string.right(std::floor(spacePerPart));
 
-    return beforeEllipsis + ELLIPSIS + afterEllipsis;
+    return beforeEllipsis + GUIUtil::fontAwesomeLight(ELLIPSIS) + afterEllipsis;
 }
 
 QString superscriptSpan(const QString& sText)
@@ -1088,15 +1021,15 @@ QString getAccountLabel(CAccount* account)
     else if ( account->IsPoW2Witness() )
     {
         if (account->GetWarningState() == AccountStatus::WitnessEmpty)
-            accountNamePrefix = GUIUtil::fontAwesomeSolid("\uf19c");
+            accountNamePrefix = GUIUtil::fontAwesomeLight("\uf19c");
         else if (account->GetWarningState() == AccountStatus::WitnessPending)
-            accountNamePrefix = QString("<table cellspacing=0 padding=0><tr><td>%1</td><td valign=top>%2</td><table>").arg(GUIUtil::fontAwesomeRegular("\uf19c")).arg(superscriptSpan(GUIUtil::fontAwesomeSolid("\uf251")));
+            accountNamePrefix = QString("<table cellspacing=0 padding=0><tr><td>%1</td><td valign=top>%2</td><table>").arg(GUIUtil::fontAwesomeLight("\uf19c")).arg(superscriptSpan(GUIUtil::fontAwesomeSolid("\uf251")));
         else if (account->GetWarningState() == AccountStatus::WitnessExpired)
-            accountNamePrefix = QString("<table cellspacing=0 padding=0><tr><td>%1</td><td valign=top>%2</td><table>").arg(GUIUtil::fontAwesomeSolid("\uf19c")).arg(colourSpan("#c97676", superscriptSpan(GUIUtil::fontAwesomeSolid("\uf12a"))));
+            accountNamePrefix = QString("<table cellspacing=0 padding=0><tr><td>%1</td><td valign=top>%2</td><table>").arg(GUIUtil::fontAwesomeLight("\uf19c")).arg(colourSpan("#c97676", superscriptSpan(GUIUtil::fontAwesomeSolid("\uf12a"))));
         else if (account->GetWarningState() == AccountStatus::WitnessEnded)
-            accountNamePrefix = QString("<table cellspacing=0 padding=0><tr><td>%1</td><td valign=top>%2</td><table>").arg(GUIUtil::fontAwesomeSolid("\uf19c")).arg(superscriptSpan(GUIUtil::fontAwesomeSolid("\uf11e")));
+            accountNamePrefix = QString("<table cellspacing=0 padding=0><tr><td>%1</td><td valign=top>%2</td><table>").arg(GUIUtil::fontAwesomeLight("\uf19c")).arg(superscriptSpan(GUIUtil::fontAwesomeSolid("\uf11e")));
         else
-            accountNamePrefix = QString("<table cellspacing=0 padding=0><tr><td>%1</td><td valign=top>%2</td><table>").arg(GUIUtil::fontAwesomeSolid("\uf19c")).arg(superscriptSpan(GUIUtil::fontAwesomeSolid("\uf023")));
+            accountNamePrefix = QString("<table cellspacing=0 padding=0><tr><td>%1</td><td valign=top>%2</td><table>").arg(GUIUtil::fontAwesomeLight("\uf19c")).arg(superscriptSpan(GUIUtil::fontAwesomeSolid("\uf023")));
     }
     else if ( !account->IsHD() )
     {
@@ -1116,37 +1049,40 @@ QString getAccountLabel(CAccount* account)
     return accountName;
 }
 
-void GuldenGUI::refreshTabVisibilities()
+void GUI::refreshTabVisibilities()
 {
-    m_pImpl->receiveCoinsAction->setVisible( true );
-    m_pImpl->sendCoinsAction->setVisible( true );
+    LogPrint(BCLog::QT, "GUI::refreshTabVisibilities\n");
+
+    receiveCoinsAction->setVisible( true );
+    sendCoinsAction->setVisible( true );
 
     //Required here because when we open wallet and it is already on a read only account restoreCachedWidgetIfNeeded is not called.
     if (pactiveWallet->getActiveAccount()->IsReadOnly())
-        m_pImpl->sendCoinsAction->setVisible( false );
+        sendCoinsAction->setVisible( false );
 
     if (pactiveWallet->getActiveAccount()->IsPoW2Witness())
     {
-        m_pImpl->receiveCoinsAction->setVisible( false );
-        m_pImpl->sendCoinsAction->setVisible( false );
-        m_pImpl->witnessDialogAction->setVisible( true );
-        if ( m_pImpl->walletFrame->currentWalletView()->currentWidget() == (QWidget*)m_pImpl->walletFrame->currentWalletView()->receiveCoinsPage || m_pImpl->walletFrame->currentWalletView()->currentWidget() == (QWidget*)m_pImpl->walletFrame->currentWalletView()->sendCoinsPage )
+        receiveCoinsAction->setVisible( false );
+        sendCoinsAction->setVisible( false );
+        witnessDialogAction->setVisible( true );
+        if ( walletFrame->currentWalletView()->currentWidget() == (QWidget*)walletFrame->currentWalletView()->receiveCoinsPage || walletFrame->currentWalletView()->currentWidget() == (QWidget*)walletFrame->currentWalletView()->sendCoinsPage )
         {
-            m_pImpl->showWitnessDialog();
+            showWitnessDialog();
         }
     }
     else
     {
-        m_pImpl->witnessDialogAction->setVisible( false );
+        witnessDialogAction->setVisible( false );
     }
 }
 
-QCollator collateAccountsNumerically;
-auto cmpAccounts = [&](const QString& s1, const QString& s2){ return collateAccountsNumerically.compare(s1, s2) < 0; };
-std::map<QString, CAccount*, decltype(cmpAccounts)> getSortedAccounts()
+
+std::map<QString, CAccount*, std::function<bool(const QString&, const QString&)>> getSortedAccounts()
 {
+    QCollator collateAccountsNumerically;
     collateAccountsNumerically.setNumericMode(true);
-    std::map<QString, CAccount*, decltype(cmpAccounts)> sortedAccounts(cmpAccounts);
+    std::function<bool(const QString&, const QString&)> cmpAccounts = [collateAccountsNumerically](const QString& s1, const QString& s2){ return collateAccountsNumerically.compare(s1, s2) < 0; };
+    std::map<QString, CAccount*, std::function<bool(const QString&, const QString&)>> sortedAccounts(cmpAccounts);
     {
         for ( const auto& accountPair : pactiveWallet->mapAccounts )
         {
@@ -1157,9 +1093,9 @@ std::map<QString, CAccount*, decltype(cmpAccounts)> getSortedAccounts()
     return sortedAccounts;
 }
 
-void GuldenGUI::refreshAccountControls()
+void GUI::refreshAccountControls()
 {
-    LogPrintf("GuldenGUI::refreshAccountControls\n");
+    LogPrint(BCLog::QT, "GUI::refreshAccountControls\n");
 
     refreshTabVisibilities();
 
@@ -1178,7 +1114,7 @@ void GuldenGUI::refreshAccountControls()
 
             // Sort the accounts.
             ClickableLabel* makeActive = NULL;
-            std::map<QString, CAccount*, decltype(cmpAccounts)> sortedAccounts = getSortedAccounts();
+            auto sortedAccounts = getSortedAccounts();
             {
                 //NB! Mutex scope here is important to avoid deadlock inside setActiveAccountButton
                 LOCK(pactiveWallet->cs_wallet);
@@ -1200,7 +1136,7 @@ void GuldenGUI::refreshAccountControls()
                         accountScrollArea->layout()->addWidget( accLabel );
                     }
                     m_accountMap[accLabel] = sortedIter.second;
-                    if (sortedIter.second->getUUID() == m_pImpl->walletFrame->currentWalletView()->walletModel->getActiveAccount()->getUUID())
+                    if (sortedIter.second->getUUID() == walletFrame->currentWalletView()->walletModel->getActiveAccount()->getUUID())
                         makeActive = accLabel;
                     ++nCount;
                 }
@@ -1212,48 +1148,28 @@ void GuldenGUI::refreshAccountControls()
                 }
             }
             if (makeActive)
-            setActiveAccountButton( makeActive );
+                setActiveAccountButton( makeActive );
         }
         // Force layout to update now that all the changes are made.
         accountScrollArea->layout()->setEnabled(true);
     }
 }
 
-bool GuldenGUI::setCurrentWallet( const QString& name )
+
+ClickableLabel* GUI::createAccountButton( const QString& accountName )
 {
-    LogPrintf("GuldenGUI::setCurrentWallet %s\n", name.toStdString());
-
-    showToolBars();
-    refreshAccountControls();
-
-    connect( m_pImpl->walletFrame->currentWalletView()->walletModel, SIGNAL( balanceChanged(CAmount, CAmount, CAmount, CAmount, CAmount, CAmount) ), m_pImpl->accountSummaryWidget , SLOT( balanceChanged() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
-    connect( m_pImpl->walletFrame->currentWalletView()->walletModel, SIGNAL( balanceChanged(CAmount, CAmount, CAmount, CAmount, CAmount, CAmount) ), this , SLOT( balanceChanged() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
-    connect( m_pImpl->walletFrame->currentWalletView()->walletModel, SIGNAL( accountListChanged() ), this , SLOT( accountListChanged() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
-    connect( m_pImpl->walletFrame->currentWalletView()->walletModel, SIGNAL( activeAccountChanged(CAccount*) ), this , SLOT( activeAccountChanged(CAccount*) ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
-    connect( m_pImpl->walletFrame->currentWalletView()->walletModel, SIGNAL( accountDeleted(CAccount*) ), this , SLOT( accountDeleted(CAccount*) ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
-    connect( m_pImpl->walletFrame->currentWalletView()->walletModel, SIGNAL( accountAdded(CAccount*) ), this , SLOT( accountAdded(CAccount*) ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
-    connect( m_pImpl->walletFrame->currentWalletView()->witnessDialogPage, SIGNAL(requestEmptyWitness()), this, SLOT(requestEmptyWitness()), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
-    connect( m_pImpl->walletFrame->currentWalletView()->witnessDialogPage, SIGNAL(requestFundWitness(CAccount*)), this, SLOT(requestFundWitness(CAccount*)), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
-    connect( m_pImpl->walletFrame->currentWalletView()->witnessDialogPage, SIGNAL(requestRenewWitness(CAccount*)), this, SLOT(requestRenewWitness(CAccount*)) );
-    connect( m_pImpl->walletFrame->currentWalletView()->sendCoinsPage, SIGNAL(notifyPaymentAccepted()), this, SLOT(handlePaymentAccepted()) );
-
-    return true;
-}
-
-
-ClickableLabel* GuldenGUI::createAccountButton( const QString& accountName )
-{
-    ClickableLabel* newAccountButton = new ClickableLabel( m_pImpl );
+    ClickableLabel* newAccountButton = new ClickableLabel( this );
+    newAccountButton->setObjectName(QString("account_selection_button_%1").arg(rand()));
     newAccountButton->setTextFormat( Qt::RichText );
     newAccountButton->setText( accountName );
     newAccountButton->setCursor( Qt::PointingHandCursor );
-    m_pImpl->connect( newAccountButton, SIGNAL( clicked() ), this, SLOT( accountButtonPressed() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
+    connect( newAccountButton, SIGNAL( clicked() ), this, SLOT( accountButtonPressed() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
     return newAccountButton;
 }
 
-void GuldenGUI::setActiveAccountButton( ClickableLabel* activeButton )
+void GUI::setActiveAccountButton( ClickableLabel* activeButton )
 {
-    LogPrintf("GuldenGUI::setActiveAccountButton\n");
+    LogPrint(BCLog::QT, "GUI::setActiveAccountButton\n");
 
     for ( const auto & button : accountBar->findChildren<ClickableLabel*>( "" ) )
     {
@@ -1264,58 +1180,94 @@ void GuldenGUI::setActiveAccountButton( ClickableLabel* activeButton )
     activeButton->setCursor( Qt::ArrowCursor );
 
      // Update the account
-    if ( m_pImpl->walletFrame->currentWalletView() )
+    if ( walletFrame->currentWalletView() )
     {
-        if ( m_pImpl->walletFrame->currentWalletView()->receiveCoinsPage )
+        if ( walletFrame->currentWalletView()->receiveCoinsPage )
         {
-            m_pImpl->accountSummaryWidget->setActiveAccount( m_accountMap[activeButton] );
-            m_pImpl->walletFrame->currentWalletView()->walletModel->setActiveAccount( m_accountMap[activeButton] );
+            accountSummaryWidget->setActiveAccount( m_accountMap[activeButton] );
+            walletFrame->currentWalletView()->walletModel->setActiveAccount( m_accountMap[activeButton] );
 
             updateAccount(m_accountMap[activeButton]);
         }
     }
 }
 
-void GuldenGUI::updateAccount(CAccount* account)
+void GUI::updateAccount(CAccount* account)
 {
+    LogPrint(BCLog::QT, "GUI::updateAccount\n");
     LOCK(pactiveWallet->cs_wallet);
 
-    if (receiveAddress)
-        delete receiveAddress;
-
-    receiveAddress = new CReserveKey(pactiveWallet, account, KEYCHAIN_EXTERNAL);
+    CReserveKey* receiveAddress = new CReserveKey(pactiveWallet, account, KEYCHAIN_EXTERNAL);
     CPubKey pubKey;
     if (receiveAddress->GetReservedKey(pubKey))
     {
         CKeyID keyID = pubKey.GetID();
-        m_pImpl->walletFrame->currentWalletView()->receiveCoinsPage->updateAddress( QString::fromStdString(CGuldenAddress(keyID).ToString()) );
+        walletFrame->currentWalletView()->receiveCoinsPage->updateAddress( QString::fromStdString(CGuldenAddress(keyID).ToString()) );
     }
     else
     {
-        m_pImpl->walletFrame->currentWalletView()->receiveCoinsPage->updateAddress( "error" );
+        LogPrint(BCLog::ALL, "Keypool exhausted for account.\n");
+        walletFrame->currentWalletView()->receiveCoinsPage->updateAddress( "error" );
     }
-    m_pImpl->walletFrame->currentWalletView()->receiveCoinsPage->setActiveAccount( account );
+    walletFrame->currentWalletView()->receiveCoinsPage->setActiveAccount( account );
+    receiveAddress->ReturnKey();
+    delete receiveAddress;
 }
 
-void GuldenGUI::balanceChanged()
+void GUI::balanceChanged()
 {
+    LogPrint(BCLog::QT, "GUI::balanceChanged\n");
+
     // Force receive Qr code to update on balance change.
-    if (m_pImpl && m_pImpl->walletFrame && m_pImpl->walletFrame->currentWalletView() && m_pImpl->walletFrame->currentWalletView()->walletModel)
-        updateAccount( m_pImpl->walletFrame->currentWalletView()->walletModel->getActiveAccount() );
+    if (this && walletFrame && walletFrame->currentWalletView() && walletFrame->currentWalletView()->walletModel)
+        updateAccount( walletFrame->currentWalletView()->walletModel->getActiveAccount() );
 }
 
 
-void GuldenGUI::accountListChanged()
+void GUI::accountNameChanged(CAccount* account)
 {
-    refreshAccountControls();
+    LogPrint(BCLog::QT, "GUI::accountNameChanged\n");
+
+    //Disable layout to prevent updating to changes immediately
+    accountScrollArea->layout()->setEnabled(false);
+    {
+        accountDeleted(account);
+        ClickableLabel* added = accountAddedHelper(account);
+        if (account->getUUID() == walletFrame->currentWalletView()->walletModel->getActiveAccount()->getUUID())
+            setActiveAccountButton(added);
+    }
+    // Force layout to update now that all the changes are made.
+    accountScrollArea->layout()->setEnabled(true);
 }
 
-void GuldenGUI::activeAccountChanged(CAccount* account)
+void GUI::accountWarningChanged(CAccount* account)
 {
-    if (m_pImpl->accountSummaryWidget)
-        m_pImpl->accountSummaryWidget->setActiveAccount(account);
+    LogPrint(BCLog::QT, "GUI::accountWarningChanged\n");
+
+    if (!account)
+        return;
+
+    boost::uuids::uuid searchUUID = account->getUUID();
+    for (auto& iter : m_accountMap)
+    {
+        if (iter.second->getUUID() == searchUUID)
+        {
+            iter.first->setText( getAccountLabel(account) );
+            break;
+        }
+    }
+}
+
+void GUI::activeAccountChanged(CAccount* account)
+{
+    LogPrint(BCLog::QT, "GUI::activeAccountChanged\n");
+
+    if (accountSummaryWidget)
+        accountSummaryWidget->setActiveAccount(account);
 
     refreshTabVisibilities();
+    if ( walletFrame)
+        walletFrame->currentWalletView()->witnessDialogPage->update();
 
     //Update account name 'in place' in account list
     bool haveAccount=false;
@@ -1342,17 +1294,15 @@ void GuldenGUI::activeAccountChanged(CAccount* account)
     }
 }
 
-// For performance reasons we update only the specific control that is added instead of regenerating all controls.
-void GuldenGUI::accountAdded(CAccount* addedAccount)
+ClickableLabel* GUI::accountAddedHelper(CAccount* addedAccount)
 {
-    //Disable layout to prevent updating to changes immediately
-    accountScrollArea->layout()->setEnabled(false);
     if (pactiveWallet)
     {
-        //NB! Mutex scope here is important to avoid deadlock inside setActiveAccountButton
+        //NB! Mutex scope here is important to avoid deadlock inside setActiveAccountButton - we lock inside the function and not outside where setActive potentially takes place.
         LOCK(pactiveWallet->cs_wallet);
 
-        std::map<QString, CAccount*, decltype(cmpAccounts)> sortedAccounts = getSortedAccounts();
+        auto sortedAccounts = getSortedAccounts();
+        sortedAccounts[QString::fromStdString(addedAccount->getLabel())] = addedAccount;
         for (const auto& sortedIter : sortedAccounts)
         {
             if (sortedIter.second->getUUID() == addedAccount->getUUID())
@@ -1362,21 +1312,52 @@ void GuldenGUI::accountAdded(CAccount* addedAccount)
                 m_accountMap[accLabel] = sortedIter.second;
                 int pos = std::distance(sortedAccounts.begin(), sortedAccounts.find(QString::fromStdString(addedAccount->getLabel())));
                 ((QVBoxLayout*)accountScrollArea->layout())->insertWidget(pos, accLabel);
-                break;
+                return accLabel;
             }
         }
+    }
+    return nullptr;
+}
+
+void GUI::accountAdded(CAccount* addedAccount)
+{
+    LogPrint(BCLog::QT, "GUI::accountAdded\n");
+
+    if (!addedAccount || (addedAccount->m_State != AccountState::Normal && !(fShowChildAccountsSeperately && addedAccount->m_State == AccountState::ShadowChild)) )
+        return;
+
+    //Disable layout to prevent updating to changes immediately
+    accountScrollArea->layout()->setEnabled(false);
+    {
+        ClickableLabel* added = accountAddedHelper(addedAccount);
+        if (addedAccount->getUUID() == walletFrame->currentWalletView()->walletModel->getActiveAccount()->getUUID())
+            setActiveAccountButton(added);
     }
     // Force layout to update now that all the changes are made.
     accountScrollArea->layout()->setEnabled(true);
 }
 
-//fixme: (Post-2.1) - This is a bit lazy; accountAdded/accountDeleted should instead update only the specific controls affected instead of all the controls.
-void GuldenGUI::accountDeleted(CAccount* account)
+void GUI::accountDeleted(CAccount* account)
 {
-    refreshAccountControls();
+    LogPrint(BCLog::QT, "GUI::accountDeleted\n");
+
+    if (!account)
+        return;
+
+    boost::uuids::uuid searchUUID = account->getUUID();
+    for (auto iter = m_accountMap.begin(); iter != m_accountMap.end(); ++iter)
+    {
+        if (searchUUID == iter->second->getUUID())
+        {
+            accountScrollArea->layout()->removeWidget(iter->first);
+            iter->first->deleteLater();
+            m_accountMap.erase(iter);
+            break;
+        }
+    }
 }
 
-void GuldenGUI::accountButtonPressed()
+void GUI::accountButtonPressed()
 {
     QObject* sender = this->sender();
     ClickableLabel* accButton = qobject_cast<ClickableLabel*>( sender );
@@ -1386,9 +1367,11 @@ void GuldenGUI::accountButtonPressed()
 
 
 
-void GuldenGUI::promptImportPrivKey()
+void GUI::promptImportPrivKey()
 {
-    ImportPrivKeyDialog dlg(this->m_pImpl);
+    LogPrint(BCLog::QT, "GUI::promptImportPrivKey\n");
+
+    ImportPrivKeyDialog dlg(this);
     dlg.exec();
 
     CGuldenSecret vchSecret;
@@ -1401,7 +1384,7 @@ void GuldenGUI::promptImportPrivKey()
         CKey key = vchSecret.GetKey();
         if (!key.IsValid())
         {
-            m_pImpl->message(tr("Error importing private key"), tr("Invalid private key."), CClientUIInterface::MSG_ERROR, NULL);
+            message(tr("Error importing private key"), tr("Invalid private key."), CClientUIInterface::MSG_ERROR, NULL);
             return;
         }
 
@@ -1412,7 +1395,7 @@ void GuldenGUI::promptImportPrivKey()
         //Don't import an address that is already in wallet.
         if (pactiveWallet->HaveKey(vchAddress))
         {
-            m_pImpl->message(tr("Error importing private key"), tr("Wallet already contains key."), CClientUIInterface::MSG_ERROR, NULL);
+            message(tr("Error importing private key"), tr("Wallet already contains key."), CClientUIInterface::MSG_ERROR, NULL);
             return;
         }
 
@@ -1422,7 +1405,7 @@ void GuldenGUI::promptImportPrivKey()
 
         if (!pactiveWallet->AddKeyPubKey(key, pubkey, *pAccount, KEYCHAIN_EXTERNAL))
         {
-            m_pImpl->message(tr("Error importing private key"), tr("Failed to add key to wallet."), CClientUIInterface::MSG_ERROR, NULL);
+            message(tr("Error importing private key"), tr("Failed to add key to wallet."), CClientUIInterface::MSG_ERROR, NULL);
             return;
         }
 
@@ -1432,111 +1415,123 @@ void GuldenGUI::promptImportPrivKey()
     }
 }
 
-void GuldenGUI::promptRescan()
+void GUI::promptRescan()
 {
+    LogPrint(BCLog::QT, "GUI::promptRescan\n");
+
     // Whenever a key is imported, we need to scan the whole chain - do so now
     pactiveWallet->nTimeFirstKey = 1;
     boost::thread t(rescanThread); // thread runs free
 }
 
-void GuldenGUI::gotoWebsite()
+void GUI::gotoWebsite()
 {
+    LogPrint(BCLog::QT, "GUI::gotoWebsite\n");
+
     QDesktopServices::openUrl( QUrl( "http://www.Gulden.com/" ) );
 }
 
-void GuldenGUI::restoreCachedWidgetIfNeeded()
+void GUI::restoreCachedWidgetIfNeeded()
 {
+    LogPrint(BCLog::QT, "GUI::restoreCachedWidgetIfNeeded\n");
+
     bool stateReceiveCoinsAction = true;
     bool stateSendCoinsAction = true;
 
-    m_pImpl->walletFrame->currentWalletView()->sendCoinsPage->update();
-    m_pImpl->walletFrame->currentWalletView()->witnessDialogPage->update();
+    walletFrame->currentWalletView()->sendCoinsPage->update();
+    walletFrame->currentWalletView()->witnessDialogPage->update();
 
     if (pactiveWallet->getActiveAccount()->IsReadOnly())
     {
         stateSendCoinsAction = false;
-        if ( m_pImpl->walletFrame->currentWalletView()->currentWidget() == (QWidget*)m_pImpl->walletFrame->currentWalletView()->sendCoinsPage )
+        if ( walletFrame->currentWalletView()->currentWidget() == (QWidget*)walletFrame->currentWalletView()->sendCoinsPage )
         {
-            m_pImpl->gotoReceiveCoinsPage();
+            gotoReceiveCoinsPage();
         }
     }
     if (pactiveWallet->getActiveAccount()->IsPoW2Witness())
     {
-        m_pImpl->witnessDialogAction->setVisible( true );
+        witnessDialogAction->setVisible( true );
         stateReceiveCoinsAction = false;
         stateSendCoinsAction = false;
-        if ( m_pImpl->walletFrame->currentWalletView()->currentWidget() == (QWidget*)m_pImpl->walletFrame->currentWalletView()->receiveCoinsPage || m_pImpl->walletFrame->currentWalletView()->currentWidget() == (QWidget*)m_pImpl->walletFrame->currentWalletView()->sendCoinsPage )
+        if ( walletFrame->currentWalletView()->currentWidget() == (QWidget*)walletFrame->currentWalletView()->receiveCoinsPage || walletFrame->currentWalletView()->currentWidget() == (QWidget*)walletFrame->currentWalletView()->sendCoinsPage )
         {
-            m_pImpl->showWitnessDialog();
+            showWitnessDialog();
         }
     }
     else
     {
-        m_pImpl->witnessDialogAction->setVisible( false );
-        if ( m_pImpl->walletFrame->currentWalletView()->currentWidget() == (QWidget*)m_pImpl->walletFrame->currentWalletView()->witnessDialogPage )
+        witnessDialogAction->setVisible( false );
+        if ( walletFrame->currentWalletView()->currentWidget() == (QWidget*)walletFrame->currentWalletView()->witnessDialogPage )
         {
-            m_pImpl->gotoReceiveCoinsPage();
+            gotoReceiveCoinsPage();
         }
     }
 
-    m_pImpl->historyAction->setVisible( true );
+    historyAction->setVisible( true );
     passwordAction->setVisible( false );
     backupAction->setVisible( false );
-    m_pImpl->overviewAction->setVisible( true );
+    overviewAction->setVisible( true );
 
     if (dialogPasswordModify)
     {
-        m_pImpl->walletFrame->currentWalletView()->removeWidget( dialogPasswordModify );
+        walletFrame->currentWalletView()->removeWidget( dialogPasswordModify );
         dialogPasswordModify->deleteLater();
         dialogPasswordModify = NULL;
     }
     if (dialogBackup)
     {
-        m_pImpl->walletFrame->currentWalletView()->removeWidget( dialogBackup );
+        walletFrame->currentWalletView()->removeWidget( dialogBackup );
         dialogBackup->deleteLater();
         dialogBackup = NULL;
     }
     if (dialogNewAccount)
     {
-        m_pImpl->walletFrame->currentWalletView()->removeWidget( dialogNewAccount );
+        walletFrame->currentWalletView()->removeWidget( dialogNewAccount );
         dialogNewAccount->deleteLater();
         dialogNewAccount = NULL;
     }
     if (dialogAccountSettings)
     {
-        m_pImpl->walletFrame->currentWalletView()->removeWidget( dialogAccountSettings );
+        walletFrame->currentWalletView()->removeWidget( dialogAccountSettings );
         dialogAccountSettings->deleteLater();
         dialogAccountSettings = NULL;
     }
     if (cacheCurrentWidget)
     {
-        m_pImpl->walletFrame->currentWalletView()->setCurrentWidget( cacheCurrentWidget );
+        walletFrame->currentWalletView()->setCurrentWidget( cacheCurrentWidget );
         cacheCurrentWidget = NULL;
     }
 
-    m_pImpl->receiveCoinsAction->setVisible( stateReceiveCoinsAction );
-    m_pImpl->sendCoinsAction->setVisible( stateSendCoinsAction );
+    if (receiveCoinsAction)
+        receiveCoinsAction->setVisible( stateReceiveCoinsAction );
+    if (sendCoinsAction)
+        sendCoinsAction->setVisible( stateSendCoinsAction );
 }
 
-void GuldenGUI::gotoNewAccountDialog()
+void GUI::gotoNewAccountDialog()
 {
-    if ( m_pImpl->walletFrame )
+    LogPrint(BCLog::QT, "GUI::gotoNewAccountDialog\n");
+
+    if ( walletFrame )
     {
         restoreCachedWidgetIfNeeded();
 
-        dialogNewAccount = new NewAccountDialog( m_pImpl->platformStyle, m_pImpl->walletFrame->currentWalletView(), m_pImpl->walletFrame->currentWalletView()->walletModel);
+        dialogNewAccount = new NewAccountDialog( platformStyle, walletFrame->currentWalletView(), walletFrame->currentWalletView()->walletModel);
         connect( dialogNewAccount, SIGNAL( cancel() ), this, SLOT( cancelNewAccountDialog() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
         connect( dialogNewAccount, SIGNAL( accountAdded() ), this, SLOT( acceptNewAccount() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
         connect( dialogNewAccount, SIGNAL( addAccountMobile() ), this, SLOT( acceptNewAccountMobile() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
-        cacheCurrentWidget = m_pImpl->walletFrame->currentWalletView()->currentWidget();
-        m_pImpl->walletFrame->currentWalletView()->addWidget( dialogNewAccount );
-        m_pImpl->walletFrame->currentWalletView()->setCurrentWidget( dialogNewAccount );
+        cacheCurrentWidget = walletFrame->currentWalletView()->currentWidget();
+        walletFrame->currentWalletView()->addWidget( dialogNewAccount );
+        walletFrame->currentWalletView()->setCurrentWidget( dialogNewAccount );
     }
 }
 
-void GuldenGUI::gotoPasswordDialog()
+void GUI::gotoPasswordDialog()
 {
-    if ( m_pImpl->walletFrame )
+    LogPrint(BCLog::QT, "GUI::gotoPasswordDialog\n");
+
+    if ( walletFrame )
     {
         restoreCachedWidgetIfNeeded();
 
@@ -1545,23 +1540,25 @@ void GuldenGUI::gotoPasswordDialog()
         passwordAction->setChecked(true);
         backupAction->setChecked(false);
 
-        m_pImpl->receiveCoinsAction->setVisible( false );
-        m_pImpl->sendCoinsAction->setVisible( false );
-        m_pImpl->historyAction->setVisible( false );
-        m_pImpl->overviewAction->setVisible( false );
-        m_pImpl->witnessDialogAction->setVisible( false );
+        receiveCoinsAction->setVisible( false );
+        sendCoinsAction->setVisible( false );
+        historyAction->setVisible( false );
+        overviewAction->setVisible( false );
+        witnessDialogAction->setVisible( false );
 
-        dialogPasswordModify = new PasswordModifyDialog( m_pImpl->platformStyle, m_pImpl->walletFrame->currentWalletView() );
+        dialogPasswordModify = new PasswordModifyDialog( platformStyle, walletFrame->currentWalletView() );
         connect( dialogPasswordModify, SIGNAL( dismiss() ), this, SLOT( dismissPasswordDialog() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
-        cacheCurrentWidget = m_pImpl->walletFrame->currentWalletView()->currentWidget();
-        m_pImpl->walletFrame->currentWalletView()->addWidget( dialogPasswordModify );
-        m_pImpl->walletFrame->currentWalletView()->setCurrentWidget( dialogPasswordModify );
+        cacheCurrentWidget = walletFrame->currentWalletView()->currentWidget();
+        walletFrame->currentWalletView()->addWidget( dialogPasswordModify );
+        walletFrame->currentWalletView()->setCurrentWidget( dialogPasswordModify );
     }
 }
 
-void GuldenGUI::gotoBackupDialog()
+void GUI::gotoBackupDialog()
 {
-    if ( m_pImpl->walletFrame )
+    LogPrint(BCLog::QT, "GUI::gotoBackupDialog\n");
+
+    if ( walletFrame )
     {
         restoreCachedWidgetIfNeeded();
 
@@ -1570,40 +1567,46 @@ void GuldenGUI::gotoBackupDialog()
         passwordAction->setChecked(false);
         backupAction->setChecked(true);
 
-        m_pImpl->receiveCoinsAction->setVisible( false );
-        m_pImpl->sendCoinsAction->setVisible( false );
-        m_pImpl->historyAction->setVisible( false );
-        m_pImpl->overviewAction->setVisible( false );
-        m_pImpl->witnessDialogAction->setVisible( false );
+        receiveCoinsAction->setVisible( false );
+        sendCoinsAction->setVisible( false );
+        historyAction->setVisible( false );
+        overviewAction->setVisible( false );
+        witnessDialogAction->setVisible( false );
 
-        dialogBackup = new BackupDialog( m_pImpl->platformStyle, m_pImpl->walletFrame->currentWalletView(), m_pImpl->walletFrame->currentWalletView()->walletModel);
-        connect( dialogBackup, SIGNAL( saveBackupFile() ), m_pImpl->walletFrame, SLOT( backupWallet() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
+        dialogBackup = new BackupDialog( platformStyle, walletFrame->currentWalletView(), walletFrame->currentWalletView()->walletModel);
+        connect( dialogBackup, SIGNAL( saveBackupFile() ), walletFrame, SLOT( backupWallet() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
         connect( dialogBackup, SIGNAL( dismiss() ), this, SLOT( dismissBackupDialog() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
-        cacheCurrentWidget = m_pImpl->walletFrame->currentWalletView()->currentWidget();
-        m_pImpl->walletFrame->currentWalletView()->addWidget( dialogBackup );
-        m_pImpl->walletFrame->currentWalletView()->setCurrentWidget( dialogBackup );
+        cacheCurrentWidget = walletFrame->currentWalletView()->currentWidget();
+        walletFrame->currentWalletView()->addWidget( dialogBackup );
+        walletFrame->currentWalletView()->setCurrentWidget( dialogBackup );
     }
 }
 
-void GuldenGUI::dismissBackupDialog()
+void GUI::dismissBackupDialog()
 {
+    LogPrint(BCLog::QT, "GUI::dismissBackupDialog\n");
+
     restoreCachedWidgetIfNeeded();
 }
 
-void GuldenGUI::dismissPasswordDialog()
+void GUI::dismissPasswordDialog()
 {
+    LogPrint(BCLog::QT, "GUI::dismissPasswordDialog\n");
+
     restoreCachedWidgetIfNeeded();
 }
 
-
-
-void GuldenGUI::cancelNewAccountDialog()
+void GUI::cancelNewAccountDialog()
 {
+    LogPrint(BCLog::QT, "GUI::cancelNewAccountDialog\n");
+
     restoreCachedWidgetIfNeeded();
 }
 
-void GuldenGUI::acceptNewAccount()
-{ 
+void GUI::acceptNewAccount()
+{
+    LogPrint(BCLog::QT, "GUI::acceptNewAccount\n");
+
     if ( !dialogNewAccount->getAccountName().simplified().isEmpty() )
     {
         CAccount* newAccount = nullptr;
@@ -1629,11 +1632,11 @@ void GuldenGUI::acceptNewAccount()
         {
             newAccount->SetWarningState(AccountStatus::WitnessEmpty);
             static_cast<const CGuldenWallet*>(pactiveWallet)->NotifyAccountWarningChanged(pactiveWallet, newAccount);
-            m_pImpl->showWitnessDialog();
+            showWitnessDialog();
         }
         else
         {
-            m_pImpl->gotoReceiveCoinsPage();
+            gotoReceiveCoinsPage();
         }
     }
     else
@@ -1642,41 +1645,47 @@ void GuldenGUI::acceptNewAccount()
     }
 }
 
-void GuldenGUI::acceptNewAccountMobile()
+void GUI::acceptNewAccountMobile()
 {
+    LogPrint(BCLog::QT, "GUI::acceptNewAccountMobile\n");
+
     restoreCachedWidgetIfNeeded();
 }
 
-void GuldenGUI::showAccountSettings()
+void GUI::showAccountSettings()
 {
-    LogPrintf("GuldenGUI::showAccountSettings\n");
+    LogPrint(BCLog::QT, "GUI::showAccountSettings\n");
 
-    if ( m_pImpl->walletFrame )
+    if ( walletFrame )
     {
         restoreCachedWidgetIfNeeded();
 
-        dialogAccountSettings = new AccountSettingsDialog( m_pImpl->platformStyle, m_pImpl->walletFrame->currentWalletView(), m_pImpl->walletFrame->currentWalletView()->walletModel->getActiveAccount(), m_pImpl->walletFrame->currentWalletView()->walletModel);
+        dialogAccountSettings = new AccountSettingsDialog( platformStyle, walletFrame->currentWalletView(), walletFrame->currentWalletView()->walletModel->getActiveAccount(), walletFrame->currentWalletView()->walletModel);
         connect( dialogAccountSettings, SIGNAL( dismissAccountSettings() ), this, SLOT( dismissAccountSettings() ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
-        connect( m_pImpl->walletFrame->currentWalletView()->walletModel, SIGNAL( activeAccountChanged(CAccount*) ), dialogAccountSettings, SLOT( activeAccountChanged(CAccount*) ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
-        cacheCurrentWidget = m_pImpl->walletFrame->currentWalletView()->currentWidget();
-        m_pImpl->walletFrame->currentWalletView()->addWidget( dialogAccountSettings );
-        m_pImpl->walletFrame->currentWalletView()->setCurrentWidget( dialogAccountSettings );
+        connect( walletFrame->currentWalletView()->walletModel, SIGNAL( activeAccountChanged(CAccount*) ), dialogAccountSettings, SLOT( activeAccountChanged(CAccount*) ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
+        cacheCurrentWidget = walletFrame->currentWalletView()->currentWidget();
+        walletFrame->currentWalletView()->addWidget( dialogAccountSettings );
+        walletFrame->currentWalletView()->setCurrentWidget( dialogAccountSettings );
     }
 }
 
-void GuldenGUI::dismissAccountSettings()
+void GUI::dismissAccountSettings()
 {
+    LogPrint(BCLog::QT, "GUI::dismissAccountSettings\n");
+
     restoreCachedWidgetIfNeeded();
 }
 
-void GuldenGUI::showExchangeRateDialog()
+void GUI::showExchangeRateDialog()
 {
+    LogPrint(BCLog::QT, "GUI::showExchangeRateDialog\n");
+
     if (!dialogExchangeRate)
     {
         CurrencyTableModel* currencyTabelmodel = ticker->GetCurrencyTableModel();
-        currencyTabelmodel->setBalance( m_pImpl->walletFrame->currentWalletView()->walletModel->getBalance() );
-        connect( m_pImpl->walletFrame->currentWalletView()->walletModel, SIGNAL( balanceChanged(CAmount, CAmount, CAmount, CAmount, CAmount, CAmount) ), currencyTabelmodel , SLOT( balanceChanged(CAmount, CAmount, CAmount, CAmount, CAmount, CAmount) ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
-        dialogExchangeRate = new ExchangeRateDialog( m_pImpl->platformStyle, m_pImpl, currencyTabelmodel );
+        currencyTabelmodel->setBalance( walletFrame->currentWalletView()->walletModel->getBalance() );
+        connect( walletFrame->currentWalletView()->walletModel, SIGNAL( balanceChanged(CAmount, CAmount, CAmount, CAmount, CAmount, CAmount) ), currencyTabelmodel , SLOT( balanceChanged(CAmount, CAmount, CAmount, CAmount, CAmount, CAmount) ), (Qt::ConnectionType)(Qt::AutoConnection|Qt::UniqueConnection) );
+        dialogExchangeRate = new ExchangeRateDialog( platformStyle, this, currencyTabelmodel );
         dialogExchangeRate->setOptionsModel( optionsModel );
     }
     dialogExchangeRate->show();
